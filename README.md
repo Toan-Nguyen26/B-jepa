@@ -13,92 +13,121 @@
 
 ---
 
+<div align="center">
+
 ## Models
 
-| Version | Params | Dim | Layers | Heads | Seq Len | Tokenizer  | RankMe   | Status |
-|---------|--------|-----|--------|-------|---------|------------|----------|--------|
-| v3.1    | 8.5M   | 384 | 6      | 6     | 512     | Char-level | 372/384  | ✅ [Released](https://huggingface.co/orgava/dna-bacteria-jepa) |
-| v4.0    | 48M    | 576 | 12     | 9     | 1024    | BPE (4096) | TBD      | 🔧 In progress |
+| | params | architecture | seq len | tokenizer | RankMe | weights |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **v3.1** | 8.5M | 6L x 384D x 6H | 512 | char-level | 372 / 384 | [checkpoint](https://huggingface.co/orgava/dna-bacteria-jepa) |
+| **v4.0** | 48M | 12L x 576D x 9H | 1024 | BPE (4096) | -- | in progress |
+
+</div>
 
 ## Architecture
 
-```
-                    ┌──────────────────────────────────────┐
-                    │         B-JEPA Pretraining            │
-                    │                                       │
-                    │   ┌──────────┐    ┌──────────┐       │
-                    │   │ Context  │    │  Target  │       │
-                    │   │ Encoder  │    │ Encoder  │ (EMA) │
-                    │   └────┬─────┘    └────┬─────┘       │
-                    │        │               │              │
-                    │   ┌────▼─────┐         │              │
-                    │   │Predictor │─── L_JEPA(CLS)         │
-                    │   │(narrow)  │         │              │
-                    │   └──────────┘         │              │
-                    │        │               │              │
-                    │   L_MLM(tokens)   L_VICReg(CLS)      │
-                    └──────────────────────────────────────┘
-```
+<img width="2816" height="1317" alt="Gemini_Generated_Image_3kttjv3kttjv3ktt" src="https://github.com/user-attachments/assets/ce22938e-9695-41d2-ba3b-5f8a9f08a1bd" />
 
-### Pretraining objectives
-
-| Loss      | Purpose                                         | Balancing |
-|-----------|-------------------------------------------------|-----------|
-| `L_MLM`   | Token-level masked language modeling             | GradNorm  |
-| `L_JEPA`  | CLS-token latent prediction (context → target)  | GradNorm  |
-| `L_var`   | VICReg variance — prevent complete collapse      | GradNorm  |
-| `L_cov`   | VICReg covariance — prevent dimensional collapse | GradNorm  |
-
-## Quick Start
+## Quick start
 
 ### Install
-
 ```bash
-pip install -e ".[dev]"
+git clone https://github.com/VUzan-bio/bdna-jepa.git && cd bdna-jepa
+pip install -e ".[all]"
 ```
 
 ### Pretrain
-
 ```bash
-python scripts/pretrain.py --config configs/training/v4.0.yaml
-python scripts/pretrain.py --config configs/training/v3.1.yaml          # reproduce baseline
+python scripts/pretrain.py --config configs/training/v4.0.yaml     # 48M model (A100)
+python scripts/pretrain.py --config configs/training/v3.1.yaml     # 8.5M baseline (any GPU)
 ```
 
 ### Evaluate
-
 ```bash
-python scripts/evaluate.py \
-    --checkpoint outputs/checkpoints/v4.0/best.pt \
-    --config configs/evaluation/full.yaml
+python scripts/evaluate.py --checkpoint outputs/checkpoints/v4.0/best.pt --version v4.0
+# → RankMe, kNN, linear probe, GC R², clustering, UMAP
 ```
 
-### Use embeddings
-
+### Use as feature extractor
 ```python
 from bdna_jepa import load_encoder
 
 encoder = load_encoder("orgava/dna-bacteria-jepa", version="v4.0")
-embeddings = encoder.encode_sequences(["ATCGATCGATCG..."])
-# → (1, 576) tensor
+embeddings = encoder.encode_sequences(["ATCGATCG..."])  # (1, 576)
 ```
 
-## v3.1 → v4.0 Changes
+## Training
 
-| Component            | v3.1                      | v4.0                             |
-|----------------------|---------------------------|----------------------------------|
-| Encoder              | 6L × 384D × 6H           | 12L × 576D × 9H                 |
-| Predictor            | 4L × 384D (same width)   | 4L × 192D (bottleneck)          |
-| Tokenizer            | Character-level (ACGTN)   | BPE (vocab 4096)                 |
-| Position encoding    | Learned                   | Rotary (RoPE)                    |
-| Collapse prevention  | SIGReg                    | VICReg (var + cov)               |
-| Loss balancing       | Static weights            | GradNorm (α=1.5)                |
-| JEPA target          | Token-block prediction    | CLS-token latent prediction      |
-| Fragment JEPA        | ✗                         | ✓ (cross-fragment genome-level)  |
-| Sequence length      | 512                       | 1024                             |
+B-JEPA optimizes four losses jointly, balanced by [GradNorm](https://arxiv.org/abs/1711.02257):
 
-## Downstream
+```
+L_total = w_mlm · L_MLM  +  w_jepa · L_JEPA  +  w_var · L_var  +  w_cov · L_cov
+```
 
-- **[SABER](https://github.com/VUzan-bio/saber)** — CRISPR-Cas12a crRNA design pipeline using B-JEPA embeddings for MDR-TB diagnostics
+| loss | what | why |
+|---|---|---|
+| L_MLM | cross-entropy on 15% masked tokens | token-level understanding |
+| L_JEPA | MSE between predicted and target CLS | sequence-level functional context |
+| L_var | hinge: per-dim std ≥ 1 ([VICReg](https://arxiv.org/abs/2105.04906)) | prevent complete collapse |
+| L_cov | off-diagonal covariance penalty | prevent dimensional collapse |
+
+Key training details: AdamW (lr=1e-3, cosine → 1e-6), bfloat16, batch 256, 300 epochs, EMA 0.996→1.0 cosine schedule. See [`configs/training/v4.0.yaml`](configs/training/v4.0.yaml) for full config.
+
+## v3.1 → v4.0
+
+| | v3.1 | v4.0 | why |
+|---|---|---|---|
+| scale | 8.5M | 48M | 5.6× for 417-species corpus |
+| tokenizer | char-level | BPE (4096) | ~5× compression, learns motifs |
+| positions | learned | RoPE | length generalization |
+| predictor | 384D (same width) | 192D (0.33× bottleneck) | [I-JEPA](https://arxiv.org/abs/2301.08243): forces richer encoder |
+| collapse fix | SIGReg | VICReg (var + cov) | SIGReg collapsed at epoch 80 |
+| balancing | static weights | GradNorm (α=1.5) | JEPA gradient was 512× larger |
+| JEPA target | token-block | CLS latent | [JEPA-DNA](https://arxiv.org/abs/2602.17162): 2D masking fails on 1D DNA |
+| fragment JEPA | — | ✓ | cross-fragment genome context |
+
+## SABER
+
+**[SABER](https://github.com/VUzan-bio/saber)** (Systematic Automated Biosensor Engineering for Resistance) uses B-JEPA embeddings for CRISPR-Cas12a diagnostic design targeting multidrug-resistant tuberculosis.
+
+```python
+# in the SABER repo
+from bdna_jepa import load_encoder
+encoder = load_encoder("orgava/dna-bacteria-jepa", version="v4.0")
+# → score crRNA candidates, design multiplex panels, predict mismatch tolerance
+```
+
+SABER pipeline: reference genome → WHO mutation catalogue → crRNA enumeration → **B-JEPA activity scoring** → multiplex optimization. Target: 14-plex electrochemical biosensor on laser-induced graphene. Part of a BRIDGE Discovery project at ETH Zurich.
+
+## Repository
+
+```
+bdna-jepa/
+├── bdna_jepa/                  # core library (pip install -e .)
+│   ├── models/                 #   encoder, predictor, jepa
+│   ├── losses/                 #   JEPA + MLM + VICReg + GradNorm
+│   ├── data/                   #   tokenizer, dataset, masking
+│   ├── training/               #   trainer
+│   ├── evaluation/             #   probing, clustering, visualization
+│   ├── utils/                  #   RankMe, features, logging
+│   ├── config.py               #   versioned dataclass configs
+│   └── hub.py                  #   HuggingFace load/save
+├── configs/                    #   YAML: model, training, evaluation
+├── scripts/                    #   pretrain · evaluate · visualize · export
+├── tools/                      #   download_genomes · extract · tokenize
+├── tests/
+└── docs/
+```
+
+## References
+
+- [I-JEPA](https://arxiv.org/abs/2301.08243) (Assran et al., 2023) — predictor bottleneck, EMA schedule
+- [JEPA-DNA](https://arxiv.org/abs/2602.17162) (Larey et al., 2026) — dual MLM+CLS-JEPA on DNA
+- [C-JEPA](https://arxiv.org/abs/2407.09394) (Mo et al., 2024) — VICReg for JEPA
+- [V-JEPA](https://arxiv.org/abs/2404.08471) (Bardes et al., 2024) — multi-scale masking
+- [ProkBERT](https://doi.org/10.1093/nar/gkae1070) (Ligeti et al., 2024) — prokaryote MLM baseline
+- [GradNorm](https://arxiv.org/abs/1711.02257) (Chen et al., 2018) — multi-task gradient balancing
+- [VICReg](https://arxiv.org/abs/2105.04906) (Bardes et al., 2022) — variance-covariance regularization
 
 ## Citation
 
