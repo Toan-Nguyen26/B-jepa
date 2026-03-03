@@ -2,17 +2,24 @@
 # Character-level tokenizer, learned positional encoding
 
 encoder:
-  vocab_size: 128        # char-level: A/C/G/T/N + specials
+  vocab_size: 128
   embed_dim: 384
   num_layers: 6
   num_heads: 6
   ff_dim: 1024
+  ff_activation: gelu
   dropout: 0.1
   max_seq_len: 512
   pos_encoding: learned
+  norm_type: layernorm
+  qk_norm: false
+  bias: true
 
 predictor:
   depth: 4
-  dim: 384               # same width as encoder (no bottleneck)
+  dim: 384
   num_heads: 6
   ff_dim: 1024
+  ff_activation: gelu
+  norm_type: layernorm
+  bias: true

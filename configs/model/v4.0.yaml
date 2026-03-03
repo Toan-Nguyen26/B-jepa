@@ -1,19 +1,25 @@
 # B-JEPA v4.0 — 48M parameter foundation model
-# BPE tokenizer, RoPE, asymmetric predictor bottleneck
-# References: I-JEPA (Assran 2023), JEPA-DNA (Larey 2026), C-JEPA (Mo 2024)
+# BPE tokenizer, RoPE, SwiGLU, RMSNorm, QK-Norm, Stop-Grad
 
 encoder:
-  vocab_size: 4096       # BPE tokenizer trained on bacterial corpus
+  vocab_size: 4096
   embed_dim: 576
   num_layers: 12
-  num_heads: 9           # head_dim = 64
-  ff_dim: 2304           # 4× embed_dim
+  num_heads: 9
+  ff_dim: 2304
+  ff_activation: swiglu
   dropout: 0.1
-  max_seq_len: 1024      # ~5,000 bp per fragment with BPE
+  max_seq_len: 1024
   pos_encoding: rotary
+  norm_type: rmsnorm
+  qk_norm: true
+  bias: false
 
 predictor:
   depth: 4
-  dim: 192               # 0.33× encoder dim (I-JEPA bottleneck principle)
-  num_heads: 6           # head_dim = 32
+  dim: 192
+  num_heads: 6
   ff_dim: 768
+  ff_activation: swiglu
+  norm_type: rmsnorm
+  bias: false

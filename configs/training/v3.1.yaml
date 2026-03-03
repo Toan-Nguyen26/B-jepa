@@ -1,20 +1,46 @@
 # B-JEPA v3.1 training recipe (reproduce baseline)
-version: v3.1
 
-epochs: 100
-batch_size: 64
-peak_lr: 3.0e-4
-warmup_epochs: 10
-mixed_precision: true
+encoder:
+  vocab_size: 128
+  embed_dim: 384
+  num_layers: 6
+  num_heads: 6
+  ff_dim: 1024
+  ff_activation: gelu
+  max_seq_len: 512
+  pos_encoding: learned
+  norm_type: layernorm
+  qk_norm: false
+  bias: true
 
-data_path: data/processed/pretrain_sequences_expanded.csv
-checkpoint_dir: outputs/checkpoints/v3.1
-save_every: 10
-eval_every: 10
+predictor:
+  depth: 4
+  dim: 384
+  num_heads: 6
+  ff_dim: 1024
+  ff_activation: gelu
+  norm_type: layernorm
+  bias: true
 
-use_gradnorm: false
-use_fragment_jepa: false
-loss_weight_vicreg_var: 10.0
-loss_weight_vicreg_cov: 1.0
+loss:
+  target_mode: stop_grad
+  use_gradnorm: false
+  weight_vicreg_var: 10.0
+  weight_vicreg_cov: 1.0
+  fragment:
+    enabled: false
 
-seed: 42
+training:
+  epochs: 100
+  batch_size: 64
+  peak_lr: 3.0e-4
+  warmup_epochs: 10
+  mixed_precision: true
+  precision: bf16
+  data_path: data/processed/pretrain_sequences_expanded.csv
+  checkpoint_dir: outputs/checkpoints/v3.1
+  save_every: 10
+  eval_every: 10
+  use_wandb: true
+  wandb_project: bdna-jepa
+  seed: 42
