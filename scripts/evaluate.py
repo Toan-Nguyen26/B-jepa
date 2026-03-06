@@ -117,19 +117,22 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
         if dataclasses.is_dataclass(obj) and isinstance(obj, type):
             config_classes[name] = obj
 
-    # Build BJEPAConfig by resolving nested dataclasses
-    type_hints = {f.name: f.type for f in dataclasses.fields(BJEPAConfig)}
-    config_kwargs = {}
-    for key, value in raw.items():
-        if key in type_hints:
-            type_name = type_hints[key] if isinstance(type_hints[key], str) else type_hints[key].__name__
-            # Check if this field's type is one of our dataclasses
-            if isinstance(value, dict) and type_name in config_classes:
-                config_kwargs[key] = config_classes[type_name](**value)
-            else:
-                config_kwargs[key] = value
+    def build_dataclass(cls, data):
+        """Recursively build a dataclass from a dict."""
+        if not isinstance(data, dict):
+            return data
+        type_hints = {f.name: f.type for f in dataclasses.fields(cls)}
+        kwargs = {}
+        for key, value in data.items():
+            if key in type_hints:
+                type_name = type_hints[key] if isinstance(type_hints[key], str) else getattr(type_hints[key], '__name__', str(type_hints[key]))
+                if isinstance(value, dict) and type_name in config_classes:
+                    kwargs[key] = build_dataclass(config_classes[type_name], value)
+                else:
+                    kwargs[key] = value
+        return cls(**kwargs)
 
-    config = BJEPAConfig(**config_kwargs)
+    config = build_dataclass(BJEPAConfig, raw)
     print(f"Config loaded: encoder.embed_dim={config.encoder.embed_dim}, max_seq_len={config.encoder.max_seq_len}")
 
     # Build full BJEPA model (has context_encoder + mlm_head)
