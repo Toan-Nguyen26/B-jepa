@@ -157,8 +157,8 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
     # Load tokenizer — try BPE first, fall back to CharTokenizer
     try:
         from bdna_jepa.data.tokenizer import BPETokenizer
-        tokenizer = BPETokenizer.from_file(tokenizer_path)
-        print(f"Tokenizer: BPE from {tokenizer_path}")
+        tokenizer = BPETokenizer(tokenizer_path)
+        print(f"Tokenizer: BPE from {tokenizer_path}, vocab={tokenizer.vocab_size}")
     except (ImportError, AttributeError):
         tokenizer = CharTokenizer()
         print("Tokenizer: CharTokenizer (fallback)")
@@ -168,12 +168,12 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
 
 def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int):
     """Build a dataloader for evaluation."""
-    from bdna_jepa.data.dataset import PretrainDataset
+    from bdna_jepa.data.dataset import BacterialGenomeDataset
 
-    dataset = PretrainDataset(
-        data_path=data_path,
+    dataset = BacterialGenomeDataset(
+        csv_path=data_path,
         tokenizer=tokenizer,
-        max_seq_len=max_seq_len,
+        max_length=max_seq_len,
     )
 
     # Subsample
