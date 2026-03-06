@@ -1,0 +1,12 @@
+{
+  "checkpoint": "outputs/checkpoints/v4.0/epoch0039.pt",
+  "n_samples": 6000,
+  "d_model": 576,
+  "rankme": 354.16448974609375,
+  "mean_feature_std": 0.12598340213298798,
+  "mean_cosine_similarity": 0.9923086762428284,
+  "mean_norm": 35.359378814697266,
+  "std_norm": 0.13110357522964478,
+  "dead_neuron_frac": 0.0,
+  "mlm": null
+}
