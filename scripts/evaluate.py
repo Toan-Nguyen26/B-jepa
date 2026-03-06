@@ -166,6 +166,27 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
     return model, tokenizer, config
 
 
+def pad_collate(batch, pad_id=0):
+    """Collate with padding for variable-length sequences."""
+    max_len = max(item["input_ids"].shape[0] for item in batch)
+    padded_batch = {}
+    for key in batch[0]:
+        if key == "input_ids":
+            padded = torch.full((len(batch), max_len), pad_id, dtype=batch[0][key].dtype)
+            for i, item in enumerate(batch):
+                L = item[key].shape[0]
+                padded[i, :L] = item[key]
+            padded_batch[key] = padded
+        elif isinstance(batch[0][key], torch.Tensor):
+            try:
+                padded_batch[key] = torch.stack([item[key] for item in batch])
+            except RuntimeError:
+                padded_batch[key] = [item[key] for item in batch]
+        else:
+            padded_batch[key] = [item[key] for item in batch]
+    return padded_batch
+
+
 def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int):
     """Build a dataloader for evaluation."""
     from bdna_jepa.data.dataset import BacterialGenomeDataset
@@ -187,6 +208,7 @@ def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int
         num_workers=2,
         pin_memory=True,
         drop_last=False,
+        collate_fn=pad_collate,
     )
     return loader
 
