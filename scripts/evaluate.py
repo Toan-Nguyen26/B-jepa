@@ -168,22 +168,19 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
 
 def pad_collate(batch, pad_id=0):
     """Collate with padding for variable-length sequences."""
-    max_len = max(item["input_ids"].shape[0] for item in batch)
+    max_len = max(item["tokens"].shape[0] for item in batch)
     padded_batch = {}
-    for key in batch[0]:
-        if key == "input_ids":
-            padded = torch.full((len(batch), max_len), pad_id, dtype=batch[0][key].dtype)
-            for i, item in enumerate(batch):
-                L = item[key].shape[0]
-                padded[i, :L] = item[key]
-            padded_batch[key] = padded
-        elif isinstance(batch[0][key], torch.Tensor):
-            try:
-                padded_batch[key] = torch.stack([item[key] for item in batch])
-            except RuntimeError:
-                padded_batch[key] = [item[key] for item in batch]
-        else:
-            padded_batch[key] = [item[key] for item in batch]
+    # Pad tokens
+    padded = torch.full((len(batch), max_len), pad_id, dtype=batch[0]["tokens"].dtype)
+    for i, item in enumerate(batch):
+        L = item["tokens"].shape[0]
+        padded[i, :L] = item["tokens"]
+    padded_batch["input_ids"] = padded  # rename to input_ids for consistency
+
+    # Collect gc_content
+    padded_batch["gc_content"] = torch.tensor([item.get("gc_content", 0.5) for item in batch])
+    # Collect species
+    padded_batch["species"] = [item.get("species", "") for item in batch]
     return padded_batch
 
 
@@ -249,8 +246,12 @@ def extract_embeddings(model, dataloader, device, max_batches=None):
         cls_embeddings.append(cls_emb.cpu())
         all_input_ids.append(input_ids.cpu())
 
-        gc = compute_gc_from_ids(input_ids.cpu())
-        all_gc_contents.append(gc)
+        # Use real GC content from dataset
+        gc = batch.get("gc_content", compute_gc_from_ids(input_ids.cpu()))
+        if isinstance(gc, torch.Tensor):
+            all_gc_contents.append(gc.cpu())
+        else:
+            all_gc_contents.append(torch.tensor(gc))
 
         if (i + 1) % 20 == 0:
             print(f"  Extracted {(i+1) * BATCH_SIZE} samples...")
