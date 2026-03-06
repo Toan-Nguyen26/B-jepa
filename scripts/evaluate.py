@@ -288,14 +288,13 @@ def compute_gc_from_ids(input_ids: torch.Tensor) -> torch.Tensor:
 
 @torch.no_grad()
 def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
-    """
-    Evaluate MLM accuracy by masking tokens and checking predictions.
-    """
+    """Evaluate MLM accuracy by masking tokens and checking predictions."""
     from bdna_jepa.data.masking import random_mask
 
     correct = 0
     total = 0
     loss_sum = 0.0
+    n_evaluated = 0
 
     encoder = model.context_encoder
     mlm_head = model.mlm_head
@@ -307,7 +306,7 @@ def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
         input_ids = batch["input_ids"].to(device)
         B, L = input_ids.shape
 
-        # Apply masking (returns masked_tokens, mask, labels)
+        # Apply masking
         masked_ids, mask, labels = random_mask(
             input_ids, mask_ratio=mask_ratio, mask_id=1,
             vocab_size=4096, special_token_max=5,
@@ -316,22 +315,36 @@ def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
         # Forward through encoder
         out = encoder(masked_ids)
 
-        # Get token embeddings
+        # Extract token-level embeddings (need shape B, L, D)
         if isinstance(out, dict):
-            token_embs = out.get("tokens", out.get("x"))
+            # Try common keys for token outputs
+            token_embs = None
+            for key in ["tokens", "x", "hidden_states", "last_hidden_state"]:
+                if key in out and out[key] is not None:
+                    token_embs = out[key]
+                    break
             if token_embs is None:
-                # If encoder returns (B, L+1, D) with CLS, skip CLS
-                token_embs = list(out.values())[0]
+                # Might only have CLS — can't do MLM
+                print(f"  WARNING: Encoder dict has keys {list(out.keys())} — no token-level output found")
+                return None
         elif isinstance(out, torch.Tensor):
-            # (B, L+1, D) — skip CLS token at position 0
-            token_embs = out[:, 1:, :]  # (B, L, D)
+            token_embs = out
         else:
-            raise ValueError(f"Unexpected output type: {type(out)}")
+            print(f"  WARNING: Unexpected encoder output type: {type(out)}")
+            return None
 
-        # Ensure token_embs matches input length
-        if token_embs.shape[1] != L:
-            # CLS prepended — skip first token
-            token_embs = token_embs[:, 1:L+1, :]
+        # Handle dimensions
+        if token_embs.dim() == 2:
+            # (B, D) — only CLS, can't do token-level MLM
+            print(f"  WARNING: Encoder returns 2D output {token_embs.shape} — no token-level predictions possible")
+            return None
+
+        # If encoder prepends CLS: (B, L+1, D) -> strip CLS
+        if token_embs.shape[1] == L + 1:
+            token_embs = token_embs[:, 1:, :]  # (B, L, D)
+        elif token_embs.shape[1] != L:
+            print(f"  WARNING: Token embs shape {token_embs.shape} doesn't match input length {L}")
+            return None
 
         # MLM head prediction
         logits = mlm_head(token_embs)  # (B, L, vocab_size)
@@ -341,8 +354,8 @@ def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
         if valid.sum() == 0:
             continue
 
-        masked_logits = logits[valid]  # (N_masked, vocab_size)
-        masked_labels = labels[valid]  # (N_masked,)
+        masked_logits = logits[valid]
+        masked_labels = labels[valid]
 
         preds = masked_logits.argmax(dim=-1)
         correct += (preds == masked_labels).sum().item()
@@ -350,13 +363,14 @@ def evaluate_mlm(model, dataloader, device, mask_ratio=0.15, n_batches=50):
 
         loss = F.cross_entropy(masked_logits, masked_labels)
         loss_sum += loss.item()
+        n_evaluated += 1
 
     if total == 0:
-        print("  WARNING: No masked tokens found")
+        print("  WARNING: No masked tokens evaluated")
         return None
 
     accuracy = correct / total
-    avg_loss = loss_sum / min(n_batches, i + 1)
+    avg_loss = loss_sum / max(n_evaluated, 1)
 
     print(f"  MLM Accuracy: {accuracy:.4f} ({correct}/{total})")
     print(f"  MLM Loss: {avg_loss:.4f} (vs ln(810)={np.log(810):.4f} random baseline)")
