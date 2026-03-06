@@ -104,14 +104,33 @@ def load_model_and_tokenizer(checkpoint_path: str, config_path: str, tokenizer_p
     from bdna_jepa.data.tokenizer import CharTokenizer
 
     # Load config from YAML
-    try:
-        config = BJEPAConfig.from_yaml(config_path)
-    except AttributeError:
-        # Fallback: load yaml manually and construct config
-        import yaml
-        with open(config_path) as f:
-            raw = yaml.safe_load(f)
-        config = BJEPAConfig(**raw) if isinstance(raw, dict) else BJEPAConfig()
+    import yaml
+    import dataclasses
+    import bdna_jepa.config as config_module
+    with open(config_path) as f:
+        raw = yaml.safe_load(f)
+
+    # Collect all dataclass types from config module
+    config_classes = {}
+    for name in dir(config_module):
+        obj = getattr(config_module, name)
+        if dataclasses.is_dataclass(obj) and isinstance(obj, type):
+            config_classes[name] = obj
+
+    # Build BJEPAConfig by resolving nested dataclasses
+    type_hints = {f.name: f.type for f in dataclasses.fields(BJEPAConfig)}
+    config_kwargs = {}
+    for key, value in raw.items():
+        if key in type_hints:
+            type_name = type_hints[key] if isinstance(type_hints[key], str) else type_hints[key].__name__
+            # Check if this field's type is one of our dataclasses
+            if isinstance(value, dict) and type_name in config_classes:
+                config_kwargs[key] = config_classes[type_name](**value)
+            else:
+                config_kwargs[key] = value
+
+    config = BJEPAConfig(**config_kwargs)
+    print(f"Config loaded: encoder.embed_dim={config.encoder.embed_dim}, max_seq_len={config.encoder.max_seq_len}")
 
     # Build full BJEPA model (has context_encoder + mlm_head)
     model = BJEPA(config)
