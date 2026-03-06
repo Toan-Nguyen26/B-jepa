@@ -218,7 +218,6 @@ def build_dataloader(data_path: str, tokenizer, max_seq_len: int, n_samples: int
 def extract_embeddings(model, dataloader, device, max_batches=None):
     """Extract CLS embeddings from the BJEPA model's context encoder."""
     cls_embeddings = []
-    all_input_ids = []
     all_gc_contents = []
 
     encoder = model.context_encoder
@@ -234,20 +233,17 @@ def extract_embeddings(model, dataloader, device, max_batches=None):
         if isinstance(out, dict):
             cls_emb = out.get("cls", out.get("cls_token"))
             if cls_emb is None:
-                # Fallback: first token of sequence output
                 tokens = out.get("tokens", out.get("x"))
                 cls_emb = tokens[:, 0, :]
         elif isinstance(out, torch.Tensor):
-            # (B, L+1, D) with CLS prepended — take first token
             cls_emb = out[:, 0, :]
         else:
             raise ValueError(f"Unexpected encoder output type: {type(out)}")
 
         cls_embeddings.append(cls_emb.cpu())
-        all_input_ids.append(input_ids.cpu())
 
         # Use real GC content from dataset
-        gc = batch.get("gc_content", compute_gc_from_ids(input_ids.cpu()))
+        gc = batch.get("gc_content", torch.full((input_ids.shape[0],), 0.5))
         if isinstance(gc, torch.Tensor):
             all_gc_contents.append(gc.cpu())
         else:
@@ -257,11 +253,10 @@ def extract_embeddings(model, dataloader, device, max_batches=None):
             print(f"  Extracted {(i+1) * BATCH_SIZE} samples...")
 
     cls_embeddings = torch.cat(cls_embeddings, dim=0)  # (N, D)
-    all_input_ids = torch.cat(all_input_ids, dim=0)
     all_gc_contents = torch.cat(all_gc_contents, dim=0)
 
     print(f"  Total: {cls_embeddings.shape[0]} embeddings, dim={cls_embeddings.shape[1]}")
-    return cls_embeddings, all_input_ids, all_gc_contents
+    return cls_embeddings, all_gc_contents
 
 
 def compute_gc_from_ids(input_ids: torch.Tensor) -> torch.Tensor:
@@ -886,7 +881,7 @@ def main():
 
     # ── Extract embeddings ──
     print("\n[3/7] Extracting embeddings...")
-    embeddings, input_ids, gc_contents = extract_embeddings(model, loader, device)
+    embeddings, gc_contents = extract_embeddings(model, loader, device)
 
     # ── Compute metrics ──
     print("\n[4/7] Computing embedding health...")
