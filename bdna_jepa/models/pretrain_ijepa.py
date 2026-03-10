@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
-"""B-JEPA v4.3 — I-JEPA architecture for bacterial DNA.
+"""B-JEPA v4.4 — I-JEPA architecture for bacterial DNA.
 
-Merges the working v3 Cas12aJEPA architecture (per-token prediction,
-multi-block masking, learnable mask tokens) with v4's BPE tokenizer
-and scaled data pipeline.
+v4.4 changes from v4.3
+-----------------------
+- **Cosine prediction loss** replaces MSE — norm-invariant, eliminates norm explosion
+  that caused v4.3 collapse at epoch 2 (RankMe 381→9.9 due to MSE amplifying norms)
+- **Peak LR 3e-5** (v4.3 used 1e-4, collapsed between lr=3e-5 and 4e-5)
+- **UMAP + t-SNE visualization** actually called in eval loop (was defined but never called)
+- Logs cosine loss (bounded 0-2) instead of MSE (unbounded, grew to 230+)
 
-Architecture verified against:
-  - I-JEPA (Assran et al., CVPR 2023): multi-block masking + predictor with mask tokens
-  - V-JEPA (Bardes et al., 2024): 90% masking, per-token prediction
-  - JEPA-DNA (Larey et al., 2026): MLM + JEPA dual objective, BPE tokenizer
-  - GeneJEPA (Litman et al., 2025): VICReg + centering, EMA 0.996→0.9995
-  - C-JEPA (Mo et al., NeurIPS 2024): VICReg integration prevents collapse
-  - LeJEPA (Balestriero & LeCun, 2025): SIGReg replaces VICReg
+Architecture (unchanged from v4.3, verified against I-JEPA/V-JEPA/C-JEPA):
+  - TransformerEncoder: 12L, 576D, 9H, pre-norm, GELU
+  - JEPAPredictor: 4L, 384D, mask tokens + positional embeddings
+  - Per-token prediction at masked positions (NOT CLS→CLS)
+  - EMA target encoder: cosine 0.996→1.0
+  - VICReg var+cov on context-pooled embeddings
+  - Multi-block masking: 4 blocks, curriculum 15%→50%
 
 Usage:
     cd /workspace/bdna-jepa
-    python scripts/pretrain_ijepa.py \\
-        --data data/processed/pretrain_2M.csv \\
-        --tokenizer data/tokenizer/bpe_4096.json \\
-        --epochs 30 --batch-size 64 --lr 3e-4
+    python bdna_jepa/models/pretrain_ijepa.py \
+        --data data/processed/pretrain_2M.csv \
+        --tokenizer data/tokenizer/bpe_4096.json \
+        --epochs 30 --batch-size 64 --lr 3e-5
 """
 from __future__ import annotations
 
@@ -29,9 +33,7 @@ import os
 import random
 import sys
 import time
-from collections import defaultdict
 from contextlib import nullcontext
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import numpy as np
@@ -52,10 +54,21 @@ try:
 except ImportError:
     HAS_WANDB = False
 
+try:
+    import umap
+    from sklearn.manifold import TSNE
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    HAS_VIZ = True
+except ImportError:
+    HAS_VIZ = False
+    print("Warning: umap-learn/sklearn/matplotlib not found — install for UMAP/t-SNE viz")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# BPE Tokenizer (from bdna-jepa v4)
-# ═══════════════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BPE Tokenizer
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class BPETokenizer:
     """BPE tokenizer wrapping HuggingFace tokenizers library."""
@@ -77,9 +90,9 @@ class BPETokenizer:
         return tokens != self.pad_id
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Dataset
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class GenomeFragmentDataset(Dataset):
     """CSV dataset with 'sequence' column, tokenized with BPE."""
@@ -99,9 +112,9 @@ class GenomeFragmentDataset(Dataset):
         return torch.tensor(ids, dtype=torch.long)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Encoder (scaled v3 SparseTransformerEncoder)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Encoder
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class TransformerEncoder(nn.Module):
     """Transformer encoder returning pooled + per-token embeddings."""
@@ -137,7 +150,6 @@ class TransformerEncoder(nn.Module):
         x = self.dropout(x)
         key_padding_mask = ~attention_mask.bool()
         token_embs = self.encoder(x, src_key_padding_mask=key_padding_mask)
-        # Mean pool over valid tokens
         mask = attention_mask.unsqueeze(-1).float()
         pooled = (token_embs * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
         info = {"attention_mask": attention_mask}
@@ -146,9 +158,9 @@ class TransformerEncoder(nn.Module):
         return pooled, info
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# I-JEPA Predictor (from v3, verified against I-JEPA paper)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# I-JEPA Predictor
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class _PredictorBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: float = 2.0, dropout: float = 0.0):
@@ -170,15 +182,7 @@ class _PredictorBlock(nn.Module):
 
 
 class JEPAPredictor(nn.Module):
-    """I-JEPA-style predictor: mask tokens + positional embed + self-attention.
-
-    Takes context encoder token embeddings, replaces masked positions with
-    learnable mask token (preserving positional information), runs self-attention
-    so mask tokens attend to visible context, then projects back to encoder dim.
-
-    This is THE key anti-collapse mechanism: the predictor must output DIFFERENT
-    embeddings at different masked positions because of positional conditioning.
-    """
+    """I-JEPA-style predictor: mask tokens + positional embed + self-attention."""
     def __init__(self, embed_dim: int, predictor_dim: int = 384, depth: int = 4,
                  num_heads: int = 6, max_seq_len: int = 512):
         super().__init__()
@@ -196,36 +200,24 @@ class JEPAPredictor(nn.Module):
         self.output_proj = nn.Linear(predictor_dim, embed_dim)
 
     def forward(self, context_token_emb: torch.Tensor, target_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            context_token_emb: (B, L, D) from context encoder
-            target_mask: (B, L) bool, True = masked/target position
-        Returns:
-            (B, L, D) predictions at ALL positions (loss selects masked ones)
-        """
         B, L, _ = context_token_emb.shape
-        x = self.input_proj(context_token_emb)  # (B, L, D_pred)
-        # Replace masked positions with learnable mask token
-        target_float = target_mask.unsqueeze(-1).float()  # (B, L, 1)
+        x = self.input_proj(context_token_emb)
+        target_float = target_mask.unsqueeze(-1).float()
         x = x * (1.0 - target_float) + self.mask_token.expand(B, L, -1) * target_float
-        # Add positional embedding (critical for position-dependent predictions)
         x = x + self.pos_embed[:, :L, :]
         for block in self.blocks:
             x = block(x)
-        return self.output_proj(self.norm(x))  # (B, L, D)
+        return self.output_proj(self.norm(x))
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# Multi-Block Masking (I-JEPA style, from v3)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Multi-Block Masking (I-JEPA style)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def multi_block_mask_1d(seq_len: int, mask_ratio: float, num_target_blocks: int,
                         min_block_len: int, eligible: torch.Tensor,
                         device: torch.device) -> torch.Tensor:
-    """I-JEPA multi-block masking for 1D sequences.
-
-    Creates non-overlapping contiguous target spans. Context = everything outside targets.
-    """
+    """I-JEPA multi-block masking for 1D sequences."""
     B = eligible.shape[0]
     target_mask = torch.zeros(B, seq_len, dtype=torch.bool, device=device)
     elig_lens = eligible.sum(dim=1)
@@ -275,9 +267,9 @@ def curriculum_masking_params(epoch, total_epochs, mr_start=0.15, mr_end=0.50,
     return mask_ratio, max(1, block_len)
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# VICReg (from C-JEPA — proven to prevent collapse in JEPA)
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# VICReg (C-JEPA anti-collapse)
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def _variance_loss(z: torch.Tensor, gamma: float = 1.0) -> torch.Tensor:
     return F.relu(gamma - z.float().std(dim=0)).mean()
@@ -291,9 +283,9 @@ def _covariance_loss(z: torch.Tensor) -> torch.Tensor:
     return off_diag / D
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Monitoring utilities
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 @torch.no_grad()
 def compute_rankme(embeddings: torch.Tensor) -> float:
@@ -304,19 +296,77 @@ def compute_rankme(embeddings: torch.Tensor) -> float:
     return torch.exp(-(p * torch.log(p + 1e-12)).sum()).item()
 
 
-# ═══════════════════════════════════════════════════════════════════════════
-# B-JEPA Model (v3 architecture, v4 scale)
-# ═══════════════════════════════════════════════════════════════════════════
+def generate_embeddings_viz(model, loader, device, epoch, save_dir,
+                            use_wandb=False, max_samples=5000):
+    """Generate UMAP + t-SNE visualizations of encoder embeddings."""
+    if not HAS_VIZ:
+        print("  Skipping viz — umap-learn/matplotlib not installed")
+        return None
+
+    model.eval()
+    all_embs = []
+    with torch.no_grad():
+        for i, batch in enumerate(loader):
+            if len(all_embs) * batch.shape[0] >= max_samples:
+                break
+            batch = batch.to(device)
+            emb = model.encode(batch)
+            all_embs.append(emb.cpu())
+
+    embs = torch.cat(all_embs, dim=0)[:max_samples].numpy()
+    os.makedirs(save_dir, exist_ok=True)
+
+    fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+
+    # UMAP
+    try:
+        reducer = umap.UMAP(n_components=2, n_neighbors=30, min_dist=0.3, random_state=42)
+        umap_coords = reducer.fit_transform(embs)
+        axes[0].scatter(umap_coords[:, 0], umap_coords[:, 1], s=1, alpha=0.3, c='steelblue')
+        axes[0].set_title(f'UMAP — Epoch {epoch+1}')
+        axes[0].set_xlabel('UMAP-1')
+        axes[0].set_ylabel('UMAP-2')
+    except Exception as e:
+        axes[0].text(0.5, 0.5, f'UMAP failed: {e}', ha='center', va='center',
+                     transform=axes[0].transAxes)
+        axes[0].set_title(f'UMAP — Epoch {epoch+1} (failed)')
+
+    # t-SNE (cap at 3K for speed)
+    try:
+        n_tsne = min(len(embs), 3000)
+        tsne = TSNE(n_components=2, perplexity=30, random_state=42, n_iter=1000)
+        tsne_coords = tsne.fit_transform(embs[:n_tsne])
+        axes[1].scatter(tsne_coords[:, 0], tsne_coords[:, 1], s=1, alpha=0.3, c='coral')
+        axes[1].set_title(f't-SNE — Epoch {epoch+1}')
+        axes[1].set_xlabel('t-SNE-1')
+        axes[1].set_ylabel('t-SNE-2')
+    except Exception as e:
+        axes[1].text(0.5, 0.5, f't-SNE failed: {e}', ha='center', va='center',
+                     transform=axes[1].transAxes)
+        axes[1].set_title(f't-SNE — Epoch {epoch+1} (failed)')
+
+    plt.suptitle(f'B-JEPA v4.4 Embeddings — Epoch {epoch+1}', fontsize=14, fontweight='bold')
+    plt.tight_layout()
+
+    fig_path = os.path.join(save_dir, f'embeddings_epoch{epoch+1:03d}.png')
+    plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f"  Saved viz: {fig_path}")
+
+    if use_wandb and HAS_WANDB:
+        wandb.log({"viz/embeddings": wandb.Image(fig_path)})
+
+    return fig_path
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# B-JEPA Model
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class BJEPA(nn.Module):
     """B-JEPA: I-JEPA architecture for bacterial DNA sequences.
 
-    Forward pass:
-        1. Multi-block mask → target positions
-        2. Context encoder: input with targets replaced by PAD → (B, L, D)
-        3. Predictor: context embeddings + mask tokens at target positions → (B, L, D)
-        4. Target encoder (EMA): full input → (B, L, D)
-        5. Loss = MSE(pred[masked], target[masked]) + VICReg(context_pooled)
+    v4.4: Uses cosine similarity loss instead of MSE for norm-invariant training.
     """
     def __init__(self, encoder: TransformerEncoder, predictor_dim: int = 384,
                  predictor_depth: int = 4, predictor_heads: int = 6,
@@ -356,37 +406,30 @@ class BJEPA(nn.Module):
 
         if attention_mask is None:
             attention_mask = tokens != pad_token_id
-
         eligible = tokens != pad_token_id
 
-        # I-JEPA multi-block masking
         target_mask = multi_block_mask_1d(
             L, mask_ratio, num_target_blocks, min_block_len, eligible, device,
         )
 
-        # Context encoder: masked input
         masked_tokens = tokens.clone()
         masked_tokens[target_mask] = pad_token_id
         _, ctx_info = self.context_encoder(
             masked_tokens, attention_mask, return_token_embeddings=True,
         )
-        ctx_emb = ctx_info["token_embeddings"]  # (B, L, D)
+        ctx_emb = ctx_info["token_embeddings"]
 
-        # Predictor: context + mask tokens → predictions at all positions
-        pred_all = self.predictor(ctx_emb, target_mask)  # (B, L, D)
+        pred_all = self.predictor(ctx_emb, target_mask)
 
-        # Target encoder: full input (no grad)
         with torch.no_grad():
             _, tgt_info = self.target_encoder(
                 tokens, attention_mask, return_token_embeddings=True,
             )
-            tgt_emb = tgt_info["token_embeddings"]  # (B, L, D)
+            tgt_emb = tgt_info["token_embeddings"]
 
-        # Extract predictions and targets at masked positions
-        pred_masked = pred_all[target_mask]    # (N_masked, D)
-        target_masked = tgt_emb[target_mask]   # (N_masked, D)
+        pred_masked = pred_all[target_mask]
+        target_masked = tgt_emb[target_mask]
 
-        # Context-pooled embedding (for VICReg regularization)
         visible = eligible & ~target_mask
         vis_float = visible.unsqueeze(-1).float()
         context_pooled = (ctx_emb * vis_float).sum(dim=1) / vis_float.sum(dim=1).clamp(min=1)
@@ -406,9 +449,9 @@ class BJEPA(nn.Module):
         return pooled
 
 
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 # Training
-# ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def cosine_lr(optimizer, step, total, warmup, peak, floor=1e-6):
     if step < warmup:
@@ -422,7 +465,7 @@ def cosine_lr(optimizer, step, total, warmup, peak, floor=1e-6):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="B-JEPA v4.3 Pretraining")
+    parser = argparse.ArgumentParser(description="B-JEPA v4.4 Pretraining")
     # Data
     parser.add_argument("--data", type=str, default="data/processed/pretrain_2M.csv")
     parser.add_argument("--tokenizer", type=str, default="data/tokenizer/bpe_4096.json")
@@ -432,23 +475,23 @@ def main():
     parser.add_argument("--num-layers", type=int, default=12)
     parser.add_argument("--num-heads", type=int, default=9)
     parser.add_argument("--ff-dim", type=int, default=2304)
-    # Predictor (I-JEPA proportions)
+    # Predictor
     parser.add_argument("--predictor-dim", type=int, default=384)
     parser.add_argument("--predictor-depth", type=int, default=4)
     parser.add_argument("--predictor-heads", type=int, default=6)
     # Training
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=3e-5)  # v4.4: 3e-5 (v4.3 used 1e-4)
     parser.add_argument("--min-lr", type=float, default=1e-6)
     parser.add_argument("--warmup-epochs", type=int, default=5)
     parser.add_argument("--weight-decay", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--grad-accum", type=int, default=1)
-    # EMA (I-JEPA defaults)
+    # EMA
     parser.add_argument("--ema-start", type=float, default=0.996)
     parser.add_argument("--ema-end", type=float, default=1.0)
-    # Masking (I-JEPA curriculum)
+    # Masking
     parser.add_argument("--mask-ratio-start", type=float, default=0.15)
     parser.add_argument("--mask-ratio-end", type=float, default=0.50)
     parser.add_argument("--num-target-blocks", type=int, default=4)
@@ -461,7 +504,7 @@ def main():
     parser.add_argument("--save-every", type=int, default=5)
     parser.add_argument("--eval-every", type=int, default=1)
     parser.add_argument("--log-every", type=int, default=50)
-    parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints/v4.3")
+    parser.add_argument("--checkpoint-dir", type=str, default="outputs/checkpoints/v4.4")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--wandb-project", type=str, default="bdna-jepa")
     parser.add_argument("--seed", type=int, default=42)
@@ -522,22 +565,25 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=True)
 
     os.makedirs(args.checkpoint_dir, exist_ok=True)
+    os.makedirs(os.path.join(args.checkpoint_dir, "viz"), exist_ok=True)
 
     # W&B
     use_wandb = HAS_WANDB and not args.no_wandb
     if use_wandb:
         wandb.init(
             project=args.wandb_project,
-            name=f"bjepa-v4.3-{args.num_layers}L{args.embed_dim}D-ijepa",
+            name=f"bjepa-v4.4-{args.num_layers}L{args.embed_dim}D-cosine",
             config=vars(args),
         )
 
     print(f"\n{'='*70}")
-    print(f"  B-JEPA v4.3 — I-JEPA Architecture for Bacterial DNA")
+    print(f"  B-JEPA v4.4 — Cosine Loss + I-JEPA Architecture")
     print(f"  {args.epochs} epochs, batch={args.batch_size}, lr={args.lr}")
+    print(f"  Loss: cosine_similarity (norm-invariant)")
     print(f"  Masking: {args.mask_ratio_start:.0%}→{args.mask_ratio_end:.0%} (4 blocks)")
     print(f"  EMA: {args.ema_start}→{args.ema_end}")
     print(f"  VICReg: var={args.vicreg_var_weight}, cov={args.vicreg_cov_weight}")
+    print(f"  Viz: UMAP + t-SNE every {args.eval_every} epoch(s) — {'enabled' if HAS_VIZ else 'DISABLED'}")
     print(f"{'='*70}\n")
 
     global_step = 0
@@ -546,7 +592,7 @@ def main():
         model.train()
         epoch_start = time.time()
 
-        # Curriculum masking
+        # Curriculum
         progress = epoch / max(args.epochs - 1, 1)
         ema_decay = model.set_ema_decay(progress)
         mask_ratio, min_block_len = curriculum_masking_params(
@@ -556,7 +602,7 @@ def main():
         )
 
         epoch_losses = []
-        epoch_pred_mse = []
+        epoch_cos_loss = []
         epoch_vicreg_var = []
         epoch_cos_sim = []
 
@@ -570,16 +616,17 @@ def main():
             tokens = tokens.to(device, non_blocking=True)
 
             with torch.autocast("cuda", dtype=torch.bfloat16):
-                # Forward: per-token prediction at masked positions
                 pred, target, info = model(
                     tokens, mask_ratio=mask_ratio, min_block_len=min_block_len,
                     num_target_blocks=args.num_target_blocks, pad_token_id=tok.pad_id,
                 )
 
-                # Loss 1: Per-token prediction MSE (I-JEPA primary loss)
-                pred_loss = F.mse_loss(pred, target)
+                # ── v4.4 KEY CHANGE: Cosine loss instead of MSE ──
+                # Bounded [0, 2], norm-invariant → no more norm explosion
+                cos_sim_per_token = F.cosine_similarity(pred, target, dim=-1)  # (N_masked,)
+                pred_loss = 1.0 - cos_sim_per_token.mean()  # cosine distance
 
-                # Loss 2: VICReg on context-pooled embeddings (C-JEPA anti-collapse)
+                # VICReg on context-pooled
                 ctx_pooled = info["context_pooled"]
                 var_loss = _variance_loss(ctx_pooled)
                 cov_loss = _covariance_loss(ctx_pooled)
@@ -598,29 +645,28 @@ def main():
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
 
-            # EMA update
             model.update_ema()
 
             # Metrics
             with torch.no_grad():
-                cos_sim = F.cosine_similarity(pred, target, dim=-1).mean().item()
+                cos_sim = cos_sim_per_token.mean().item()
 
             epoch_losses.append(total_loss.item())
-            epoch_pred_mse.append(pred_loss.item())
+            epoch_cos_loss.append(pred_loss.item())
             epoch_vicreg_var.append(var_loss.item())
             epoch_cos_sim.append(cos_sim)
 
             # Step logging
             if global_step % args.log_every == 0:
                 msg = (f"Step {global_step} | epoch {epoch} | loss={total_loss.item():.4f} | "
-                       f"pred={pred_loss.item():.4f} | cos={cos_sim:.3f} | "
+                       f"cos_loss={pred_loss.item():.4f} | cos={cos_sim:.3f} | "
                        f"var={var_loss.item():.4f} | mr={mask_ratio:.2f} | lr={lr:.2e}")
                 print(f"  {msg}")
 
                 if use_wandb:
                     wandb.log({
                         "step/loss": total_loss.item(),
-                        "step/pred_mse": pred_loss.item(),
+                        "step/cos_loss": pred_loss.item(),
                         "step/cos_sim": cos_sim,
                         "step/vicreg_var": var_loss.item(),
                         "step/vicreg_cov": cov_loss.item(),
@@ -633,12 +679,12 @@ def main():
         # Epoch summary
         ep_time = time.time() - epoch_start
         avg_loss = np.mean(epoch_losses)
-        avg_pred = np.mean(epoch_pred_mse)
+        avg_cos_loss = np.mean(epoch_cos_loss)
         avg_cos = np.mean(epoch_cos_sim)
         avg_var = np.mean(epoch_vicreg_var)
 
         print(f"\nEpoch {epoch+1}/{args.epochs} complete | avg_loss={avg_loss:.4f} | "
-              f"pred={avg_pred:.4f} | cos={avg_cos:.3f} | var={avg_var:.4f} | "
+              f"cos_loss={avg_cos_loss:.4f} | cos={avg_cos:.3f} | var={avg_var:.4f} | "
               f"time={ep_time:.1f}s")
 
         # Eval
@@ -646,25 +692,37 @@ def main():
             model.eval()
             with torch.no_grad():
                 eval_embs = []
+                eval_tokens_all = []
                 for i, batch in enumerate(loader):
                     if i >= 50: break
                     batch = batch.to(device)
                     emb = model.encode(batch)
                     eval_embs.append(emb.cpu())
+                    eval_tokens_all.append(batch.cpu())
                 eval_embs = torch.cat(eval_embs, dim=0)
                 rankme = compute_rankme(eval_embs)
                 std = eval_embs.std().item()
+                norm = eval_embs.norm(dim=-1).mean().item()
 
-            print(f"  Eval | RankMe={rankme:.1f} | std={std:.4f}")
+            print(f"  Eval | RankMe={rankme:.1f} | std={std:.4f} | norm={norm:.2f}")
 
             if use_wandb:
                 wandb.log({
                     "eval/rankme": rankme,
                     "eval/std": std,
+                    "eval/norm": norm,
                     "epoch/avg_loss": avg_loss,
-                    "epoch/avg_pred_mse": avg_pred,
+                    "epoch/avg_cos_loss": avg_cos_loss,
                     "epoch/avg_cos_sim": avg_cos,
                 }, step=global_step)
+
+            # UMAP + t-SNE visualization
+            print("  Generating UMAP + t-SNE...")
+            generate_embeddings_viz(
+                model, loader, device, epoch,
+                save_dir=os.path.join(args.checkpoint_dir, "viz"),
+                use_wandb=use_wandb,
+            )
 
             # RED FLAG checks
             if rankme < 50:
@@ -686,6 +744,7 @@ def main():
                 "scaler_state_dict": scaler.state_dict(),
                 "args": vars(args),
                 "avg_loss": avg_loss,
+                "version": "v4.4-cosine",
             }, ckpt_path)
             print(f"  Saved: {ckpt_path}")
 
@@ -697,6 +756,7 @@ def main():
         "target_encoder_state_dict": model.target_encoder.state_dict(),
         "predictor_state_dict": model.predictor.state_dict(),
         "args": vars(args),
+        "version": "v4.4-cosine",
     }, final_path)
     print(f"\nTraining complete. Final model: {final_path}")
 
