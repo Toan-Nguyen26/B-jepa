@@ -525,19 +525,24 @@ class MLMHead(nn.Module):
 # =============================================================================
 
 class SIGReg(nn.Module):
-    """SIGReg from LeJEPA (Balestriero & LeCun, 2025).
+    """SIGReg from LeJEPA (Balestriero & LeCun, 2025) + variance floor.
 
     Projects embeddings onto K random 1D directions, tests each marginal
     against N(0,1) via Epps-Pulley characteristic function test.
     Loss = 0 when distribution is perfectly isotropic Gaussian.
 
-    Superior to VICReg: single loss term, provably optimal target,
-    no variance/covariance weight tuning.
+    Added: VICReg-style variance floor (hinge on projection stds) to prevent
+    scale collapse. The original SIGReg standardizes before testing, making it
+    blind to embeddings shrinking toward zero while maintaining Gaussian shape.
+    The var_floor term penalizes projection stds below gamma, ensuring the
+    N(0,1) target is enforced for both shape AND scale.
     """
 
-    def __init__(self, num_slices: int = 512, num_points: int = 17):
+    def __init__(self, num_slices: int = 512, num_points: int = 17,
+                 var_gamma: float = 1.0):
         super().__init__()
         self.num_slices = num_slices
+        self.var_gamma = var_gamma
         t_max = 2.0
         t_points = torch.linspace(0, t_max, num_points + 1)[1:]
         self.register_buffer('t_points', t_points)
@@ -559,7 +564,7 @@ class SIGReg(nn.Module):
         B, D = embeddings.shape
         if B < 4:
             zero = torch.tensor(0.0, device=embeddings.device, requires_grad=True)
-            return zero, {"sigreg": 0.0, "std_mean": 0.0}
+            return zero, {"sigreg": 0.0, "std_mean": 0.0, "var_floor": 0.0}
 
         z = embeddings.float()
 
@@ -568,8 +573,14 @@ class SIGReg(nn.Module):
         directions = F.normalize(directions, dim=0)
         proj = z @ directions  # (B, K)
 
-        # Standardize
+        # Projection stds (before standardization)
         std = proj.std(dim=0)
+
+        # Variance floor: penalize projections with std < gamma
+        # Prevents scale collapse that the Gaussianity test misses
+        var_floor = F.relu(self.var_gamma - std).mean()
+
+        # Standardize for Gaussianity test
         proj = (proj - proj.mean(dim=0, keepdim=True)) / (std + 1e-8)
 
         # Epps-Pulley test: compare empirical CF to N(0,1) CF
@@ -584,11 +595,14 @@ class SIGReg(nn.Module):
             integrand = ecf_sq - 2 * ecf_real * tcf + tcf ** 2
             total = total + self.weights[t_idx] * integrand.mean()
 
+        loss = total + var_floor
+
         metrics = {
             "sigreg": total.item(),
+            "var_floor": var_floor.item(),
             "std_mean": std.mean().item(),
         }
-        return total, metrics
+        return loss, metrics
 
 
 # =============================================================================
@@ -736,6 +750,7 @@ class BJEPAv6(nn.Module):
         ema_start: float = 0.996,
         ema_end: float = 1.0,
         mlm_mask_ratio: float = 0.15,
+        var_gamma: float = 1.0,
         qk_norm: bool = True,
         bias: bool = False,
     ):
@@ -782,8 +797,8 @@ class BJEPAv6(nn.Module):
         # MLM head (anti-collapse)
         self.mlm_head = MLMHead(embed_dim, vocab_size)
 
-        # SIGReg (replaces VICReg)
-        self.sigreg = SIGReg(num_slices=512, num_points=17)
+        # SIGReg (replaces VICReg) + variance floor
+        self.sigreg = SIGReg(num_slices=512, num_points=17, var_gamma=var_gamma)
 
         # GC adversary
         self.gc_adversary = GCAdversary(embed_dim, hidden_dim=64)
@@ -1398,6 +1413,7 @@ def train(args):
         ema_start=args.ema_start,
         ema_end=args.ema_end,
         mlm_mask_ratio=args.mlm_mask_ratio,
+        var_gamma=args.var_gamma,
         qk_norm=True,
         bias=False,
     ).to(device)
@@ -1430,7 +1446,7 @@ def train(args):
     use_amp = device.type == "cuda"
     scaler = torch.amp.GradScaler('cuda', enabled=(use_amp and amp_dtype == torch.float16))
 
-    ckpt_dir = Path(args.output_dir) / "checkpoints" / "v6.0"
+    ckpt_dir = Path(args.output_dir) / "checkpoints" / args.run_version
     viz_dir = ckpt_dir / "viz"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     viz_dir.mkdir(parents=True, exist_ok=True)
@@ -1523,6 +1539,7 @@ def train(args):
                     "mlm": f"{met['mlm_loss']:.3f}",
                     "acc": f"{met['mlm_acc']:.3f}",
                     "sig": f"{met.get('sigreg_sigreg', 0):.4f}",
+                    "vf": f"{met.get('sigreg_var_floor', 0):.3f}",
                     "mr": f"{jepa_mr:.2f}",
                     "lr": f"{lr:.1e}",
                 })
@@ -1556,7 +1573,7 @@ def train(args):
         print(f"  JEPA:   loss={avg['jepa_loss']:.4f}  cos_sim={avg['jepa_cos_sim']:.3f}  "
               f"l2={avg['jepa_l2']:.4f}  n_tgt={avg['n_target_tokens']:.0f}")
         print(f"  MLM:    loss={avg['mlm_loss']:.4f}  acc={avg['mlm_acc']:.3f}")
-        print(f"  SIGReg: {avg.get('sigreg_sigreg', 0):.4f}  std={avg.get('sigreg_std_mean', 0):.3f}")
+        print(f"  SIGReg: {avg.get('sigreg_sigreg', 0):.4f}  var_floor={avg.get('sigreg_var_floor', 0):.4f}  std={avg.get('sigreg_std_mean', 0):.3f}")
         print(f"  GC_adv: {avg['gc_adv_loss']:.5f}")
         print(f"  RankMe: {eval_met['rankme']:.1f}/{args.embed_dim}  "
               f"GC|r|={eval_met['gc_abs_r']:.3f}  std={eval_met['std']:.3f}  "
@@ -1712,10 +1729,14 @@ def build_parser():
                     help="MLM loss weight (anti-collapse guard)")
     g.add_argument("--sigreg-weight", type=float, default=10.0,
                     help="SIGReg regularization weight")
+    g.add_argument("--var-gamma", type=float, default=1.0,
+                    help="Variance floor threshold for SIGReg (hinge on projection std)")
     g.add_argument("--gc-adv-weight", type=float, default=1.0,
                     help="GC adversary weight")
 
     g = p.add_argument_group("Logging")
+    g.add_argument("--run-version", type=str, default="v6.0",
+                    help="Version string for checkpoint directory naming")
     g.add_argument("--save-every", type=int, default=5)
     g.add_argument("--log-every", type=int, default=50)
     g.add_argument("--num-workers", type=int, default=4)
