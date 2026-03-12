@@ -357,14 +357,12 @@ class ContextEncoder(nn.Module):
         cls_pos = torch.zeros(B, 1, device=tokens.device, dtype=torch.long)
         rope_positions = torch.cat([cls_pos, position_ids + 1], dim=1)  # (B, L+1)
 
-        # Build per-sample RoPE cos/sin: (B, L+1, head_dim)
-        rope_cos_list, rope_sin_list = [], []
-        for b in range(B):
-            c, s = self.rope(rope_positions[b])
-            rope_cos_list.append(c)
-            rope_sin_list.append(s)
-        rope_cos = torch.stack(rope_cos_list, dim=0)  # (B, L+1, head_dim)
-        rope_sin = torch.stack(rope_sin_list, dim=0)
+        # Vectorized RoPE: compute cache up to max position, then index
+        max_pos = rope_positions.max().item() + 1
+        if max_pos > self.rope.cos_cached.size(0):
+            self.rope._build_cache(max_pos * 2)
+        rope_cos = self.rope.cos_cached[rope_positions]  # (B, L+1, head_dim)
+        rope_sin = self.rope.sin_cached[rope_positions]  # (B, L+1, head_dim)
 
         # Padding mask for attention: pad tokens should be ignored
         pad_mask = (tokens == self.pad_token_id)
@@ -383,76 +381,13 @@ class ContextEncoder(nn.Module):
 
 
 # =============================================================================
-# 3. Target Encoder — Processes ALL tokens (standard)
+# 3. Target Encoder — Same class as Context, dropout=0, sequential positions
 # =============================================================================
-
-class TargetEncoder(nn.Module):
-    """Full-sequence encoder for producing target embeddings.
-
-    Same architecture as ContextEncoder but always sees the complete sequence.
-    Frozen — updated only via EMA from context encoder.
-    """
-
-    def __init__(
-        self,
-        vocab_size: int,
-        embed_dim: int = 576,
-        num_layers: int = 12,
-        num_heads: int = 9,
-        ff_dim: int = 2304,
-        max_seq_len: int = 512,
-        dropout: float = 0.0,  # No dropout for target
-        pad_token_id: int = 0,
-        qk_norm: bool = True,
-        bias: bool = False,
-    ):
-        super().__init__()
-        self.embed_dim = embed_dim
-        self.pad_token_id = pad_token_id
-        self.head_dim = embed_dim // num_heads
-
-        self.token_emb = nn.Embedding(vocab_size, embed_dim, padding_idx=pad_token_id)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, embed_dim) * 0.02)
-
-        self.rope = RotaryEmbedding(self.head_dim, max_seq_len + 1)
-
-        self.layers = nn.ModuleList([
-            TransformerBlock(embed_dim, num_heads, ff_dim, qk_norm=qk_norm, bias=bias)
-            for _ in range(num_layers)
-        ])
-        self.final_norm = RMSNorm(embed_dim)
-
-    @torch.no_grad()
-    def forward(self, tokens: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        Args:
-            tokens: (B, L) full token IDs
-
-        Returns:
-            cls: (B, D)
-            tokens: (B, L, D) per-token embeddings (excluding CLS)
-        """
-        B, L = tokens.shape
-        x = self.token_emb(tokens)
-        cls_expanded = self.cls_token.expand(B, -1, -1)
-        x = torch.cat([cls_expanded, x], dim=1)  # (B, L+1, D)
-
-        # Sequential positions: CLS=0, tokens=1..L
-        positions = torch.arange(L + 1, device=tokens.device)
-        rope_cos, rope_sin = self.rope(positions)  # (L+1, head_dim)
-
-        pad_mask = (tokens == self.pad_token_id)
-        cls_mask = torch.zeros(B, 1, device=tokens.device, dtype=torch.bool)
-        key_padding_mask = torch.cat([cls_mask, pad_mask], dim=1)
-
-        for layer in self.layers:
-            x = layer(x, rope_cos, rope_sin, key_padding_mask)
-
-        x = self.final_norm(x)
-        return {
-            "cls": x[:, 0, :],
-            "tokens": x[:, 1:, :],  # (B, L, D)
-        }
+# No separate TargetEncoder class. We reuse ContextEncoder with dropout=0.0
+# and call it with sequential position IDs. This guarantees parameter names
+# match exactly for EMA, eliminating a class of silent bugs.
+#
+# The target encoder forward is handled via a helper in BJEPAv6.
 
 
 # =============================================================================
@@ -822,16 +757,18 @@ class BJEPAv6(nn.Module):
             pad_token_id=pad_token_id, qk_norm=qk_norm, bias=bias,
         )
 
-        # Target encoder (frozen, EMA) — processes ALL tokens
-        self.target_encoder = TargetEncoder(
+        # Target encoder — SAME CLASS as context, dropout=0.0.
+        # Using the same class guarantees identical parameter names for EMA.
+        self.target_encoder = ContextEncoder(
             vocab_size=vocab_size, embed_dim=embed_dim,
             num_layers=num_layers, num_heads=num_heads,
             ff_dim=ff_dim, max_seq_len=max_seq_len,
+            dropout=0.0,  # No dropout for target — stable representations
             pad_token_id=pad_token_id, qk_norm=qk_norm, bias=bias,
         )
 
-        # Initialize target from context
-        self._sync_target_from_context()
+        # Initialize target from context (exact copy, same param names)
+        self.target_encoder.load_state_dict(self.context_encoder.state_dict())
         for p in self.target_encoder.parameters():
             p.requires_grad = False
 
@@ -851,14 +788,6 @@ class BJEPAv6(nn.Module):
         # GC adversary
         self.gc_adversary = GCAdversary(embed_dim, hidden_dim=64)
 
-    def _sync_target_from_context(self):
-        """Copy context encoder weights to target encoder."""
-        ctx_state = self.context_encoder.state_dict()
-        tgt_state = self.target_encoder.state_dict()
-        for key in tgt_state:
-            if key in ctx_state:
-                tgt_state[key].copy_(ctx_state[key])
-
     def set_ema_decay(self, progress: float) -> float:
         t0, t1 = self.ema_start, self.ema_end
         self._ema_decay = t1 - (t1 - t0) * (1 + math.cos(math.pi * progress)) / 2
@@ -866,11 +795,11 @@ class BJEPAv6(nn.Module):
 
     @torch.no_grad()
     def update_ema(self):
+        """EMA update. Safe because both encoders are the same class."""
         tau = self._ema_decay
-        ctx_params = dict(self.context_encoder.named_parameters())
-        for name, tp in self.target_encoder.named_parameters():
-            if name in ctx_params:
-                tp.data.mul_(tau).add_(ctx_params[name].data, alpha=1.0 - tau)
+        for tp, cp in zip(self.target_encoder.parameters(),
+                          self.context_encoder.parameters()):
+            tp.data.mul_(tau).add_(cp.data, alpha=1.0 - tau)
 
     def _extract_visible_and_target(
         self,
@@ -879,42 +808,47 @@ class BJEPAv6(nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Extract visible and target subsequences with position IDs.
 
-        Returns padded tensors for batched processing.
+        Vectorized — no per-sample Python loops. Uses argsort trick to
+        pack variable-length subsequences into padded tensors.
         """
         B, L = tokens.shape
         device = tokens.device
         valid = tokens != self.pad_token_id  # (B, L)
         visible_mask = valid & ~target_mask  # (B, L)
 
-        # Count max lengths for padding
-        vis_counts = visible_mask.sum(dim=1)
-        tgt_counts = target_mask.sum(dim=1)
-        max_vis = vis_counts.max().item()
-        max_tgt = tgt_counts.max().item()
+        # Position indices for the full sequence
+        pos_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, -1)  # (B, L)
 
-        # Ensure minimum sizes
-        max_vis = max(max_vis, 1)
-        max_tgt = max(max_tgt, 1)
+        # --- Visible tokens (vectorized) ---
+        vis_counts = visible_mask.sum(dim=1)  # (B,)
+        max_vis = max(vis_counts.max().item(), 1)
 
-        vis_tokens = torch.full((B, max_vis), self.pad_token_id, device=device, dtype=torch.long)
-        vis_positions = torch.zeros(B, max_vis, device=device, dtype=torch.long)
-        tgt_positions = torch.zeros(B, max_tgt, device=device, dtype=torch.long)
-        tgt_padding = torch.ones(B, max_tgt, device=device, dtype=torch.bool)  # True=pad
+        # Sort so True values come first; argsort of ~mask puts True (=0) before False (=1)
+        vis_order = (~visible_mask).long().argsort(dim=1, stable=True)  # (B, L)
+        vis_sorted_tokens = torch.gather(tokens, 1, vis_order)         # (B, L)
+        vis_sorted_pos = torch.gather(pos_ids, 1, vis_order)           # (B, L)
 
-        for b in range(B):
-            vis_idx = visible_mask[b].nonzero(as_tuple=True)[0]
-            tgt_idx = target_mask[b].nonzero(as_tuple=True)[0]
+        # Truncate to max_vis
+        vis_tokens = vis_sorted_tokens[:, :max_vis].clone()
+        vis_positions = vis_sorted_pos[:, :max_vis].clone()
 
-            n_vis = len(vis_idx)
-            n_tgt = len(tgt_idx)
+        # Pad beyond each sample's count
+        vis_range = torch.arange(max_vis, device=device).unsqueeze(0)  # (1, max_vis)
+        vis_pad_mask = vis_range >= vis_counts.unsqueeze(1)            # (B, max_vis)
+        vis_tokens[vis_pad_mask] = self.pad_token_id
+        vis_positions[vis_pad_mask] = 0
 
-            if n_vis > 0:
-                vis_tokens[b, :n_vis] = tokens[b, vis_idx]
-                vis_positions[b, :n_vis] = vis_idx
+        # --- Target positions (vectorized) ---
+        tgt_counts = target_mask.sum(dim=1)  # (B,)
+        max_tgt = max(tgt_counts.max().item(), 1)
 
-            if n_tgt > 0:
-                tgt_positions[b, :n_tgt] = tgt_idx
-                tgt_padding[b, :n_tgt] = False
+        tgt_order = (~target_mask).long().argsort(dim=1, stable=True)
+        tgt_sorted_pos = torch.gather(pos_ids, 1, tgt_order)
+
+        tgt_positions = tgt_sorted_pos[:, :max_tgt].clone()
+        tgt_range = torch.arange(max_tgt, device=device).unsqueeze(0)
+        tgt_padding = tgt_range >= tgt_counts.unsqueeze(1)  # True = pad
+        tgt_positions[tgt_padding] = 0
 
         return vis_tokens, vis_positions, tgt_positions, tgt_padding, visible_mask
 
@@ -974,9 +908,10 @@ class BJEPAv6(nn.Module):
         # 4. MLM logits from visible token embeddings
         mlm_logits = self.mlm_head(context_tokens)  # (B, L_vis, vocab)
 
-        # 5. Target encoder: full input (no grad)
+        # 5. Target encoder: full input with sequential positions (no grad)
         with torch.no_grad():
-            tgt_out = self.target_encoder(tokens)
+            seq_positions = torch.arange(L, device=tokens.device).unsqueeze(0).expand(B, -1)
+            tgt_out = self.target_encoder(tokens, seq_positions)
             target_tokens_emb = tgt_out["tokens"]  # (B, L, D)
 
         # 6. JEPA predictor: predict target embeddings from context
@@ -1005,13 +940,10 @@ class BJEPAv6(nn.Module):
     @torch.no_grad()
     def encode(self, tokens: torch.Tensor, use_target: bool = True) -> torch.Tensor:
         """Extract CLS embeddings for evaluation."""
-        if use_target:
-            return self.target_encoder(tokens)["cls"]
-        else:
-            B, L = tokens.shape
-            valid = tokens != self.pad_token_id
-            positions = torch.arange(L, device=tokens.device).unsqueeze(0).expand(B, -1)
-            return self.context_encoder(tokens, positions)["cls"]
+        B, L = tokens.shape
+        positions = torch.arange(L, device=tokens.device).unsqueeze(0).expand(B, -1)
+        encoder = self.target_encoder if use_target else self.context_encoder
+        return encoder(tokens, positions)["cls"]
 
 
 # =============================================================================
@@ -1095,6 +1027,11 @@ def compute_losses(
         + args.gc_adv_weight * gc_adv_loss
     )
     metrics["total_loss"] = total.item()
+
+    # Loss contribution ratios (diagnostic: is JEPA actually driving learning?)
+    total_val = total.item() if total.item() > 0 else 1.0
+    metrics["balance/jepa_frac"] = (args.jepa_weight * jepa_loss.item()) / total_val
+    metrics["balance/mlm_frac"] = (args.mlm_weight * mlm_loss.item()) / total_val
 
     return total, metrics
 
