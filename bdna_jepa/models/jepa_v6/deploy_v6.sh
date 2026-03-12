@@ -42,7 +42,7 @@ nohup python bdna_jepa/models/jepa_v6/pretrain_v6.py \
     --batch-size 64 \
     --lr 3e-4 \
     --min-lr 1e-6 \
-    --warmup-epochs 5 \
+    --warmup-epochs 1 \
     --weight-decay 0.05 \
     --grad-clip 1.0 \
     --embed-dim 576 \

@@ -1670,7 +1670,7 @@ def build_parser():
     g.add_argument("--batch-size", type=int, default=64)
     g.add_argument("--lr", type=float, default=3e-4)
     g.add_argument("--min-lr", type=float, default=1e-6)
-    g.add_argument("--warmup-epochs", type=int, default=5)
+    g.add_argument("--warmup-epochs", type=int, default=1)
     g.add_argument("--weight-decay", type=float, default=0.05)
     g.add_argument("--grad-clip", type=float, default=1.0)
     g.add_argument("--grad-accum", type=int, default=1)
