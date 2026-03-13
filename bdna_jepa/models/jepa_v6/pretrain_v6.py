@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""B-JEPA v6.0 — True JEPA for Bacterial DNA
+"""B-JEPA v6.2 — True JEPA for Bacterial DNA
 ==============================================
 
 A genuine Joint-Embedding Predictive Architecture where JEPA is the PRIMARY
@@ -568,17 +568,20 @@ class SIGReg(nn.Module):
 
         z = embeddings.float()
 
-        # Random projection directions
+        # ---- Per-dimension variance floor (on CLS directly) ----
+        # Penalize any CLS dimension with std < gamma across the batch.
+        # This prevents dimensional collapse that random projections mask
+        # (random projections average high- and low-variance dims together).
+        cls_std = z.std(dim=0)  # (D,) per-dimension std across batch
+        var_floor = F.relu(self.var_gamma - cls_std).mean()
+
+        # Random projection directions (for Gaussianity test only)
         directions = torch.randn(D, self.num_slices, device=z.device, dtype=z.dtype)
         directions = F.normalize(directions, dim=0)
         proj = z @ directions  # (B, K)
 
         # Projection stds (before standardization)
         std = proj.std(dim=0)
-
-        # Variance floor: penalize projections with std < gamma
-        # Prevents scale collapse that the Gaussianity test misses
-        var_floor = F.relu(self.var_gamma - std).mean()
 
         # Standardize for Gaussianity test
         proj = (proj - proj.mean(dim=0, keepdim=True)) / (std + 1e-8)
@@ -600,7 +603,8 @@ class SIGReg(nn.Module):
         metrics = {
             "sigreg": total.item(),
             "var_floor": var_floor.item(),
-            "std_mean": std.mean().item(),
+            "std_mean": cls_std.mean().item(),       # CLS per-dim std (what var_floor targets)
+            "proj_std_mean": std.mean().item(),       # projection std (for reference)
         }
         return loss, metrics
 
@@ -1371,7 +1375,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'=' * 70}")
-    print(f"  B-JEPA v6.0 — True JEPA for Bacterial DNA")
+    print(f"  B-JEPA v6.2 — True JEPA for Bacterial DNA")
     print(f"{'=' * 70}")
     print(f"  Device: {device}")
     if device.type == "cuda":
@@ -1620,6 +1624,7 @@ def train(args):
             log["health/embed_std"] = eval_met["std"]
             log["health/embed_norm"] = eval_met["norm"]
             log["health/sigreg_std"] = avg.get('sigreg_std_mean', 0)
+            log["health/sigreg_proj_std"] = avg.get('sigreg_proj_std_mean', 0)
 
             # -- Schedule --
             log["schedule/lr"] = lr
@@ -1655,14 +1660,14 @@ def train(args):
                 "metrics": {k: v for k, v in {**avg, **eval_met}.items()
                             if not isinstance(v, torch.Tensor)},
                 "config": vars(args),
-                "version": "v6.0-true-jepa",
+                "version": "v6.2-true-jepa",
             }, path)
             print(f"  Saved: {path}")
 
     total_time = time.time() - t_start
     h, m = int(total_time // 3600), int(total_time % 3600 // 60)
     print(f"\n{'=' * 70}")
-    print(f"  B-JEPA v6.0 complete in {h}h {m}m")
+    print(f"  B-JEPA v6.2 complete in {h}h {m}m")
     print(f"  Best loss: {best_loss:.4f}  Final RankMe: {eval_met['rankme']:.1f}")
     print(f"{'=' * 70}")
     if use_wandb:
@@ -1674,7 +1679,7 @@ def train(args):
 # =============================================================================
 
 def build_parser():
-    p = argparse.ArgumentParser(description="B-JEPA v6.0 — True JEPA for Bacterial DNA")
+    p = argparse.ArgumentParser(description="B-JEPA v6.2 — True JEPA for Bacterial DNA")
 
     g = p.add_argument_group("Data")
     g.add_argument("--data-path", default="data/processed/pretrain_2M.csv")
@@ -1730,12 +1735,12 @@ def build_parser():
     g.add_argument("--sigreg-weight", type=float, default=10.0,
                     help="SIGReg regularization weight")
     g.add_argument("--var-gamma", type=float, default=1.0,
-                    help="Variance floor threshold for SIGReg (hinge on projection std)")
+                    help="Variance floor threshold for SIGReg (hinge on per-dim CLS std)")
     g.add_argument("--gc-adv-weight", type=float, default=1.0,
                     help="GC adversary weight")
 
     g = p.add_argument_group("Logging")
-    g.add_argument("--run-version", type=str, default="v6.0",
+    g.add_argument("--run-version", type=str, default="v6.2",
                     help="Version string for checkpoint directory naming")
     g.add_argument("--save-every", type=int, default=5)
     g.add_argument("--log-every", type=int, default=50)
