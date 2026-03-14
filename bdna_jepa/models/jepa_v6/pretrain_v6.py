@@ -1311,7 +1311,10 @@ class BPEPretrainDataset(Dataset):
 
         seq_col = 'sequence' if 'sequence' in self.df.columns else self.df.columns[0]
         self.sequences = self.df[seq_col].values
+        self.genomes = self.df['genome'].values if 'genome' in self.df.columns else None
         print(f"  Dataset: {len(self):,} sequences, max_len={max_len}")
+        if self.genomes is not None:
+            print(f"  Genomes: {len(set(self.genomes)):,} unique")
         print(f"  GC token IDs: {len(self.gc_token_ids)} tokens")
         print(f"  Mask token ID: {self.mask_id}")
 
@@ -1390,7 +1393,7 @@ def train(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     print(f"\n{'=' * 70}")
-    print(f"  B-JEPA v6.2 — True JEPA for Bacterial DNA")
+    print(f"  B-JEPA {args.run_version} — Latent Grounding for Bacterial DNA")
     print(f"{'=' * 70}")
     print(f"  Device: {device}")
     if device.type == "cuda":
@@ -1401,12 +1404,37 @@ def train(args):
         except Exception:
             pass
 
-    # Dataset
+    # Dataset (v7: genome-level train/val split for honest evaluation)
     dataset = BPEPretrainDataset(args.data_path, args.tokenizer_path, args.max_seq_len)
     pad_id = dataset.pad_id
     mask_id = dataset.mask_id
     gc_ids = dataset.gc_token_ids
     vocab_size = len(dataset.vocab)
+
+    val_dataset = None
+    val_frac = getattr(args, 'val_frac', 0.0)
+    if val_frac > 0 and hasattr(dataset, 'genomes') and dataset.genomes is not None:
+        # Genome-level split: hold out val_frac of genomes (no fragment leakage)
+        unique_genomes = sorted(set(dataset.genomes))
+        n_val_genomes = max(1, int(len(unique_genomes) * val_frac))
+        rng = torch.Generator().manual_seed(args.seed)
+        perm = torch.randperm(len(unique_genomes), generator=rng).tolist()
+        val_genome_set = set(unique_genomes[i] for i in perm[:n_val_genomes])
+
+        train_idx = [i for i, g in enumerate(dataset.genomes) if g not in val_genome_set]
+        val_idx = [i for i, g in enumerate(dataset.genomes) if g in val_genome_set]
+
+        val_dataset = torch.utils.data.Subset(dataset, val_idx)
+        dataset = torch.utils.data.Subset(dataset, train_idx)
+        print(f"  Genome-level split: {len(train_idx)} train, {len(val_idx)} val "
+              f"({len(unique_genomes) - n_val_genomes}/{n_val_genomes} genomes)")
+    elif val_frac > 0:
+        # Fallback: random split if no genome info
+        n_val = int(len(dataset) * val_frac)
+        n_train = len(dataset) - n_val
+        dataset, val_dataset = torch.utils.data.random_split(
+            dataset, [n_train, n_val], generator=torch.Generator().manual_seed(args.seed))
+        print(f"  Random split: {n_train} train, {n_val} val")
 
     dl_kwargs = dict(
         batch_size=args.batch_size, shuffle=True,
@@ -1503,12 +1531,16 @@ def train(args):
         progress = epoch / max(args.epochs - 1, 1)
         ema_tau = model.set_ema_decay(progress)
 
-        # Curriculum: mask ratio, block length, and dynamic loss weights
+        # Curriculum: mask ratio, block length, MLM difficulty, and dynamic loss weights
         jepa_mr = curriculum_schedule(epoch, args.epochs, args.jepa_mask_start, args.jepa_mask_end)
         min_blen = int(curriculum_schedule(epoch, args.epochs, args.min_block_start, args.min_block_end))
         min_blen = max(1, min_blen)
         gc_lam = GCAdversary.ganin_lambda(epoch, args.epochs) if args.gc_adv_weight > 0 else 0.0
         args._progress = progress  # Pass to compute_losses for dynamic weight schedule
+
+        # v7: MLM masking curriculum — harder masking over time
+        mlm_mr = curriculum_schedule(epoch, args.epochs, args.mlm_mask_ratio, args.mlm_mask_end)
+        model.mlm_mask_ratio = mlm_mr
 
         epoch_metrics = {}
         opt.zero_grad(set_to_none=True)
@@ -1603,7 +1635,12 @@ def train(args):
         print(f"  RankMe: {eval_met['rankme']:.1f}/{args.embed_dim}  "
               f"GC|r|={eval_met['gc_abs_r']:.3f}  std={eval_met['std']:.3f}  "
               f"norm={eval_met['norm']:.1f}")
-        print(f"  Mask: {jepa_mr:.3f}  BlockLen>={min_blen}  LR={lr:.2e}  EMA={ema_tau:.4f}")
+        print(f"  Mask: {jepa_mr:.3f}  BlockLen>={min_blen}  MLM_mr={mlm_mr:.3f}  LR={lr:.2e}  EMA={ema_tau:.4f}")
+        if getattr(args, 'dynamic_weights', False):
+            t = 0.5 * (1 - math.cos(math.pi * progress))
+            jw = args.jepa_weight * (1 - 0.8 * t)
+            mw = args.mlm_weight_start + t * (args.mlm_weight_end - args.mlm_weight_start)
+            print(f"  Weights: JEPA_w={jw:.2f}  MLM_w={mw:.2f}")
 
         if eval_met['rankme'] < 50:
             print(f"  WARNING: RankMe={eval_met['rankme']:.1f} < 50 — possible collapse!")
@@ -1726,8 +1763,10 @@ def build_parser():
     g.add_argument("--max-seq-len", type=int, default=512)
 
     g = p.add_argument_group("JEPA Predictor (cross-attention)")
-    g.add_argument("--predictor-dim", type=int, default=384)
-    g.add_argument("--predictor-depth", type=int, default=6)
+    g.add_argument("--predictor-dim", type=int, default=192,
+                    help="v7: 192 (narrow bottleneck, I-JEPA style). v6: was 384")
+    g.add_argument("--predictor-depth", type=int, default=3,
+                    help="v7: 3 layers (forces encoder to do more). v6: was 6")
     g.add_argument("--predictor-heads", type=int, default=6)
     g.add_argument("--ema-start", type=float, default=0.996)
     g.add_argument("--ema-end", type=float, default=1.0)
@@ -1745,8 +1784,10 @@ def build_parser():
                     help="Minimum block length at final epoch")
 
     g = p.add_argument_group("MLM (primary objective in v7)")
-    g.add_argument("--mlm-mask-ratio", type=float, default=0.25,
-                    help="Random mask ratio within visible tokens (v7: 25%%, v6: 15%%)")
+    g.add_argument("--mlm-mask-ratio", type=float, default=0.15,
+                    help="MLM mask ratio start (v7 curriculum: ramps to --mlm-mask-end)")
+    g.add_argument("--mlm-mask-end", type=float, default=0.30,
+                    help="MLM mask ratio at final epoch (v7: harder masking forces deeper learning)")
 
     g = p.add_argument_group("Loss Weights")
     g.add_argument("--jepa-weight", type=float, default=5.0,
@@ -1767,6 +1808,8 @@ def build_parser():
                     help="MLM weight at epoch 0 (ramps up via cosine)")
     g.add_argument("--mlm-weight-end", type=float, default=5.0,
                     help="MLM weight at final epoch")
+    g.add_argument("--val-frac", type=float, default=0.05,
+                    help="Fraction of genomes held out for validation (0=no val)")
 
     g = p.add_argument_group("Logging")
     g.add_argument("--run-version", type=str, default="v7.0",
