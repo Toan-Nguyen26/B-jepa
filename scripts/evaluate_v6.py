@@ -71,7 +71,20 @@ def load_v6_model(checkpoint_path: str, device: str):
 # 2. EXTRACT EMBEDDINGS
 # ══════════════════════════════════════════════════════════════════════════
 
-def build_dataloader(data_path, tokenizer_path, max_seq_len, n_samples, batch_size=64):
+def load_species_map(species_map_path):
+    """Load genome -> species mapping from CSV."""
+    import csv
+    mapping = {}
+    with open(species_map_path) as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            mapping[row["genome"]] = row["species"]
+    print(f"  Loaded {len(mapping)} genome->species mappings")
+    return mapping
+
+
+def build_dataloader(data_path, tokenizer_path, max_seq_len, n_samples,
+                     batch_size=64, species_map=None):
     """Build dataloader from pretrain CSV."""
     from bdna_jepa.data.tokenizer import BPETokenizer
     from bdna_jepa.data.dataset import BacterialGenomeDataset
@@ -92,10 +105,21 @@ def build_dataloader(data_path, tokenizer_path, max_seq_len, n_samples, batch_si
         for i, item in enumerate(batch):
             L = item["tokens"].shape[0]
             padded[i, :L] = item["tokens"]
+
+        # Resolve species from genome ID if species_map provided
+        species_list = []
+        for item in batch:
+            sp = item.get("species", "")
+            if (not sp or sp == "") and species_map:
+                genome = item.get("genome", "")
+                sp = species_map.get(genome, "")
+            species_list.append(sp)
+
         return {
             "input_ids": padded,
             "gc_content": torch.tensor([item.get("gc_content", 0.5) for item in batch]),
-            "species": [item.get("species", "") for item in batch],
+            "species": species_list,
+            "genome": [item.get("genome", "") for item in batch],
         }
 
     loader = DataLoader(subset, batch_size=batch_size, shuffle=False,
@@ -308,6 +332,8 @@ def main():
     parser.add_argument("--checkpoint", type=str, required=True)
     parser.add_argument("--data-path", type=str, default="data/processed/pretrain_2M.csv")
     parser.add_argument("--tokenizer-path", type=str, default="data/tokenizer/bpe_4096.json")
+    parser.add_argument("--species-map", type=str, default="data/processed/genome_species.csv",
+                        help="CSV with genome,species columns")
     parser.add_argument("--output-dir", type=str, default="outputs/eval/v6.2")
     parser.add_argument("--n-samples", type=int, default=5000)
     parser.add_argument("--device", type=str, default="auto")
@@ -327,11 +353,20 @@ def main():
     print("\n[1/5] Loading model...")
     model, cfg = load_v6_model(args.checkpoint, device)
 
+    # ── Load species mapping ──
+    species_map = None
+    if args.species_map and Path(args.species_map).exists():
+        print("\n  Loading species map...")
+        species_map = load_species_map(args.species_map)
+    else:
+        print(f"\n  No species map at {args.species_map} — species eval will be skipped")
+
     # ── Build dataloader ──
     print("\n[2/5] Building dataloader...")
     loader = build_dataloader(
         args.data_path, args.tokenizer_path,
         cfg["max_seq_len"], args.n_samples,
+        species_map=species_map,
     )
 
     # ── Extract embeddings ──
