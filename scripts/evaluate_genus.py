@@ -214,25 +214,87 @@ def load_model(checkpoint_path, device):
         raise
 
     # Load target encoder weights (preferred for eval — EMA smoothed)
-    target_key = None
+    # The checkpoint may store weights in different formats:
+    #   A) Separate dicts: ckpt["target_encoder_state_dict"] = {"cls_token": ..., "layers.0...": ...}
+    #   B) Single model dict: ckpt["model_state_dict"] = {"target_encoder.cls_token": ..., "context_encoder.cls_token": ...}
+    #   C) Flat dict: ckpt keys directly include "target_encoder.cls_token", etc.
+
+    def strip_prefix(state_dict, prefix):
+        """Remove prefix from all keys in state_dict."""
+        return {k[len(prefix):]: v for k, v in state_dict.items()
+                if k.startswith(prefix)}
+
+    loaded = False
+
+    # Strategy A: dedicated key with clean state dict
     for key in ["target_encoder_state_dict", "target_encoder", "target_state_dict"]:
         if key in ckpt:
-            target_key = key
+            sd = ckpt[key]
+            # Check if keys need prefix stripping
+            sample_key = next(iter(sd))
+            if sample_key.startswith("target_encoder."):
+                sd = strip_prefix(sd, "target_encoder.")
+            elif sample_key.startswith("context_encoder."):
+                sd = strip_prefix(sd, "context_encoder.")
+            encoder.load_state_dict(sd)
+            print(f"  Loaded TARGET encoder (EMA) from key '{key}'")
+            loaded = True
             break
 
-    if target_key:
-        encoder.load_state_dict(ckpt[target_key])
-        print(f"  Loaded TARGET encoder (EMA) — better for downstream eval")
-    else:
-        # Fall back to context encoder
-        for key in ["context_encoder_state_dict", "context_encoder",
-                     "model_state_dict", "encoder_state_dict"]:
-            if key in ckpt:
-                encoder.load_state_dict(ckpt[key])
-                print(f"  Loaded context encoder (key: {key})")
+    # Strategy B: single model state dict with prefixed keys
+    if not loaded:
+        for key in ["model_state_dict", "state_dict", "context_encoder_state_dict",
+                     "context_encoder", "encoder_state_dict"]:
+            if key not in ckpt:
+                continue
+            sd = ckpt[key]
+            sample_key = next(iter(sd))
+
+            # Try target_encoder prefix first (EMA = better for eval)
+            target_sd = strip_prefix(sd, "target_encoder.")
+            if target_sd and len(target_sd) > 10:
+                encoder.load_state_dict(target_sd)
+                print(f"  Loaded TARGET encoder (EMA) from '{key}' (stripped prefix)")
+                loaded = True
                 break
-        else:
-            raise KeyError(f"No encoder state dict found. Keys: {list(ckpt.keys())}")
+
+            # Fall back to context_encoder prefix
+            context_sd = strip_prefix(sd, "context_encoder.")
+            if context_sd and len(context_sd) > 10:
+                encoder.load_state_dict(context_sd)
+                print(f"  Loaded CONTEXT encoder from '{key}' (stripped prefix)")
+                loaded = True
+                break
+
+            # Try loading as-is (already clean keys)
+            try:
+                encoder.load_state_dict(sd)
+                print(f"  Loaded encoder from '{key}' (direct)")
+                loaded = True
+                break
+            except RuntimeError:
+                continue
+
+    # Strategy C: keys are at the top level of the checkpoint dict
+    if not loaded:
+        target_sd = strip_prefix(ckpt, "target_encoder.")
+        if target_sd and len(target_sd) > 10:
+            encoder.load_state_dict(target_sd)
+            print(f"  Loaded TARGET encoder (EMA) from top-level keys")
+            loaded = True
+
+    if not loaded:
+        context_sd = strip_prefix(ckpt, "context_encoder.")
+        if context_sd and len(context_sd) > 10:
+            encoder.load_state_dict(context_sd)
+            print(f"  Loaded CONTEXT encoder from top-level keys")
+            loaded = True
+
+    if not loaded:
+        raise KeyError(
+            f"Could not load encoder. Checkpoint keys: {list(ckpt.keys())[:10]}... "
+            f"Sample nested keys: {list(next(iter(v for v in ckpt.values() if isinstance(v, dict)), {}).keys())[:5]}"
+        )
 
     encoder = encoder.to(device).eval()
     n_params = sum(p.numel() for p in encoder.parameters())
@@ -257,8 +319,20 @@ def extract_embeddings(model, dataloader, device):
         mask = batch["mask"].to(device)
 
         # Forward — get CLS embeddings
+        # The ContextEncoder.forward() signature varies across versions.
+        # Try multiple calling conventions.
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            out = model(tokens, mask=mask)
+            try:
+                out = model(tokens, mask=mask)
+            except TypeError:
+                try:
+                    out = model(tokens, pad_mask=mask)
+                except TypeError:
+                    try:
+                        out = model(tokens, src_key_padding_mask=mask)
+                    except TypeError:
+                        # Last resort: just tokens, no mask
+                        out = model(tokens)
 
         # Extract CLS: either direct tensor or dict
         if isinstance(out, dict):
