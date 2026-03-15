@@ -314,25 +314,47 @@ def extract_embeddings(model, dataloader, device):
     all_genus_names = []
     all_phylum_names = []
 
+    # Probe the forward signature once before the loop
+    import inspect
+    sig = inspect.signature(model.forward)
+    param_names = list(sig.parameters.keys())
+    print(f"  Encoder forward signature: {sig}")
+
     for i, batch in enumerate(dataloader):
         tokens = batch["tokens"].to(device)
-        mask = batch["mask"].to(device)
+        pad_mask = batch["mask"].to(device)
 
-        # Forward — get CLS embeddings
-        # The ContextEncoder.forward() signature varies across versions.
-        # Try multiple calling conventions.
+        # Generate position_ids: 0, 1, 2, ..., seq_len-1 for each sequence
+        # For padded positions, still provide sequential IDs (mask handles ignoring them)
+        B, L = tokens.shape
+        position_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
+
+        # Build kwargs based on actual signature
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            kwargs = {}
+            # Always pass tokens as first positional arg
+            # Check what other args the forward() expects
+            if "position_ids" in param_names or "rope_positions" in param_names:
+                pos_key = "position_ids" if "position_ids" in param_names else "rope_positions"
+                kwargs[pos_key] = position_ids
+
+            # Try various mask argument names
+            for mask_name in ["mask", "pad_mask", "padding_mask", "src_key_padding_mask"]:
+                if mask_name in param_names:
+                    kwargs[mask_name] = pad_mask
+                    break
+
             try:
-                out = model(tokens, mask=mask)
-            except TypeError:
+                out = model(tokens, **kwargs)
+            except TypeError as e:
+                # If kwargs fail, try positional: model(tokens, position_ids)
                 try:
-                    out = model(tokens, pad_mask=mask)
+                    out = model(tokens, position_ids)
                 except TypeError:
-                    try:
-                        out = model(tokens, src_key_padding_mask=mask)
-                    except TypeError:
-                        # Last resort: just tokens, no mask
-                        out = model(tokens)
+                    # Absolute fallback: just tokens
+                    print(f"  WARNING: Forward call failed with kwargs and positional. "
+                          f"Trying tokens only. Error: {e}")
+                    out = model(tokens)
 
         # Extract CLS: either direct tensor or dict
         if isinstance(out, dict):
