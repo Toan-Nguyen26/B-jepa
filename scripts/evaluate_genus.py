@@ -417,19 +417,41 @@ def knn_accuracy(embeddings, labels, k_values=[1, 5, 10]):
     return results
 
 
-def linear_probe(embeddings, labels, test_frac=0.2, seed=42):
-    """Train logistic regression on frozen embeddings."""
+def linear_probe(embeddings, labels, test_frac=0.2, seed=42, min_per_class=5):
+    """Train logistic regression on frozen embeddings.
+    
+    Filters to classes with >= min_per_class samples before splitting.
+    """
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import train_test_split
     from sklearn.preprocessing import StandardScaler
 
-    n_classes = len(set(labels))
-    if n_classes < 2:
-        return {"accuracy": 0.0, "n_classes": n_classes}
+    # Filter to classes with enough samples for train/test split
+    label_counts = Counter(labels)
+    valid_classes = {c for c, n in label_counts.items() if n >= min_per_class}
 
+    if len(valid_classes) < 2:
+        return {"test_accuracy": 0.0, "train_accuracy": 0.0,
+                "n_classes": len(valid_classes), "n_train": 0, "n_test": 0,
+                "note": f"Only {len(valid_classes)} classes with >={min_per_class} samples"}
+
+    mask = np.array([l in valid_classes for l in labels])
+    X = embeddings[mask]
+    y = labels[mask]
+
+    # Remap labels to contiguous integers
+    unique_labels = sorted(set(y))
+    label_map = {old: new for new, old in enumerate(unique_labels)}
+    y = np.array([label_map[l] for l in y])
+
+    n_classes = len(unique_labels)
+    n_test = int(len(y) * test_frac)
+
+    # Use stratify only if test set is large enough
+    use_stratify = n_test >= n_classes
     X_train, X_test, y_train, y_test = train_test_split(
-        embeddings, labels, test_size=test_frac,
-        random_state=seed, stratify=labels
+        X, y, test_size=test_frac, random_state=seed,
+        stratify=y if use_stratify else None
     )
 
     scaler = StandardScaler()
