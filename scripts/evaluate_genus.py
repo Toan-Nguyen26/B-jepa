@@ -306,7 +306,10 @@ def load_model(checkpoint_path, device):
 # ─── Embedding Extraction ──────────────────────────────────────────────────
 @torch.no_grad()
 def extract_embeddings(model, dataloader, device):
-    """Extract CLS embeddings from encoder."""
+    """Extract CLS embeddings from encoder.
+    
+    If GPU OOMs (training is running), automatically falls back to CPU.
+    """
     all_embeds = []
     all_gc = []
     all_genus = []
@@ -314,60 +317,49 @@ def extract_embeddings(model, dataloader, device):
     all_genus_names = []
     all_phylum_names = []
 
-    # Probe the forward signature once before the loop
+    # Probe the forward signature once
     import inspect
     sig = inspect.signature(model.forward)
     param_names = list(sig.parameters.keys())
     print(f"  Encoder forward signature: {sig}")
+    print(f"  Running on: {device}")
 
+    t0 = time.time()
     for i, batch in enumerate(dataloader):
         tokens = batch["tokens"].to(device)
-        pad_mask = batch["mask"].to(device)
 
-        # Generate position_ids: 0, 1, 2, ..., seq_len-1 for each sequence
-        # For padded positions, still provide sequential IDs (mask handles ignoring them)
+        # Generate position_ids for RoPE: 0, 1, 2, ..., seq_len-1
         B, L = tokens.shape
         position_ids = torch.arange(L, device=device).unsqueeze(0).expand(B, L)
 
-        # Build kwargs based on actual signature
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
-            kwargs = {}
-            # Always pass tokens as first positional arg
-            # Check what other args the forward() expects
-            if "position_ids" in param_names or "rope_positions" in param_names:
-                pos_key = "position_ids" if "position_ids" in param_names else "rope_positions"
-                kwargs[pos_key] = position_ids
+        # Forward call — signature is (tokens, position_ids) -> Dict
+        # The encoder internally computes RoPE cos/sin from position_ids
+        # and derives key_padding_mask from tokens (PAD=0)
+        out = model(tokens, position_ids)
 
-            # Try various mask argument names
-            for mask_name in ["mask", "pad_mask", "padding_mask", "src_key_padding_mask"]:
-                if mask_name in param_names:
-                    kwargs[mask_name] = pad_mask
-                    break
-
-            try:
-                out = model(tokens, **kwargs)
-            except TypeError as e:
-                # If kwargs fail, try positional: model(tokens, position_ids)
-                try:
-                    out = model(tokens, position_ids)
-                except TypeError:
-                    # Absolute fallback: just tokens
-                    print(f"  WARNING: Forward call failed with kwargs and positional. "
-                          f"Trying tokens only. Error: {e}")
-                    out = model(tokens)
-
-        # Extract CLS: either direct tensor or dict
+        # Extract CLS embedding from output dict
         if isinstance(out, dict):
-            cls_emb = out.get("cls", out.get("context_cls", out.get("last_hidden_state", None)))
+            # Try common key names
+            cls_emb = None
+            for key in ["cls", "context_cls", "pooled", "last_hidden_state"]:
+                if key in out:
+                    cls_emb = out[key]
+                    break
+            if cls_emb is None:
+                # Take first value that's a tensor
+                for v in out.values():
+                    if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                        cls_emb = v
+                        break
             if cls_emb is not None and cls_emb.dim() == 3:
-                cls_emb = cls_emb[:, 0, :]  # first token = CLS
+                cls_emb = cls_emb[:, 0, :]  # CLS = first token
         elif isinstance(out, torch.Tensor):
-            if out.dim() == 3:
-                cls_emb = out[:, 0, :]
-            else:
-                cls_emb = out
+            cls_emb = out[:, 0, :] if out.dim() == 3 else out
         else:
             raise ValueError(f"Unexpected model output type: {type(out)}")
+
+        if cls_emb is None:
+            raise ValueError(f"Could not extract CLS. Output keys: {list(out.keys()) if isinstance(out, dict) else 'tensor'}")
 
         all_embeds.append(cls_emb.float().cpu())
         all_gc.append(batch["gc"])
@@ -641,12 +633,27 @@ def main():
                         help="Min fragments per genus to include")
     parser.add_argument("--max-per-genus", type=int, default=500,
                         help="Max fragments per genus")
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--device", type=str, default="auto",
+                        choices=["auto", "cpu", "cuda"],
+                        help="Device: 'cpu' to avoid OOM when training is running")
     parser.add_argument("--output-dir", required=True,
                         help="Output directory")
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.device == "auto":
+        # Check if GPU has enough free memory (need ~3GB for eval)
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.mem_get_info()[0] / 1e9
+            if free_mem > 3.0:
+                device = torch.device("cuda")
+            else:
+                print(f"  GPU has only {free_mem:.1f}GB free — using CPU to avoid OOM")
+                device = torch.device("cpu")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
     print(f"Device: {device}")
     t0 = time.time()
 
