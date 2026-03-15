@@ -460,7 +460,6 @@ def linear_probe(embeddings, labels, test_frac=0.2, seed=42, min_per_class=5):
 
     clf = LogisticRegression(
         max_iter=1000,
-        multi_class="multinomial",
         solver="lbfgs",
         C=1.0,
         random_state=seed,
