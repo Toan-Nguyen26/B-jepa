@@ -1,0 +1,57 @@
+{
+  "checkpoint": "outputs/checkpoints/v7.0/epoch0004.pt",
+  "n_samples": 2000,
+  "embed_dim": 576,
+  "n_genera": 10,
+  "n_phyla": 5,
+  "rankme": 485.1669616699219,
+  "norm_mean": 28.214439392089844,
+  "norm_std": 0.11162331700325012,
+  "per_dim_std": 1.1541402339935303,
+  "gc_r2": 0.8202263999384878,
+  "genus_knn": {
+    "1": 0.7945,
+    "5": 0.8305,
+    "10": 0.8405,
+    "20": 0.846
+  },
+  "phylum_knn": {
+    "1": 0.8295,
+    "5": 0.8595,
+    "10": 0.869
+  },
+  "genus_probe": {
+    "train_accuracy": 1.0,
+    "test_accuracy": 0.8725,
+    "n_classes": 10,
+    "n_train": 1600,
+    "n_test": 400
+  },
+  "phylum_probe": {
+    "train_accuracy": 1.0,
+    "test_accuracy": 0.85,
+    "n_classes": 5,
+    "n_train": 1600,
+    "n_test": 400
+  },
+  "genera_list": [
+    "Bradyrhizobium",
+    "Corynebacterium",
+    "Flavobacterium",
+    "Mycobacterium",
+    "Mycolicibacterium",
+    "Paenibacillus",
+    "Pseudomonas",
+    "Streptomyces",
+    "Vibrio",
+    "Wolbachia"
+  ],
+  "phyla_list": [
+    "Actinomycetota",
+    "Bacillota",
+    "Bacteroidota",
+    "Pseudomonadota",
+    "Unknown"
+  ],
+  "wall_time_seconds": 2877.6744151115417
+}
