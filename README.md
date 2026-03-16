@@ -5,7 +5,7 @@
 Self-supervised foundation model for bacterial genomics. Pretrained on 6,326 complete bacterial reference genomes (~60M fragments) using a latent grounding framework: JEPA shapes the representation space, MLM drives token-level learning. Designed for downstream transfer to TB drug resistance prediction and CRISPR-Cas12a guide design.
 
 [Model](https://huggingface.co/orgava/dna-bacteria-jepa) ·
-[GUARD Pipeline](https://github.com/VUzan-bio/guard) ·
+[COMPASS Pipeline](https://github.com/VUzan-bio/compass) ·
 [Architecture](#architecture) ·
 [Quick Start](#quick-start) ·
 [Citation](#citation)
