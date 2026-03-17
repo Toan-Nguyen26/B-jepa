@@ -1,0 +1,79 @@
+{
+  "tnf": {
+    "method": "TNF (4-mer frequency)",
+    "dim": 256,
+    "params": 0,
+    "rankme": 140.98306179381927,
+    "gc_r2": 0.9999949441466229,
+    "genus_knn": {
+      "1": 0.7905,
+      "5": 0.828,
+      "10": 0.8275,
+      "20": 0.827
+    },
+    "phylum_knn": {
+      "1": 0.8355,
+      "5": 0.87,
+      "10": 0.8705
+    },
+    "genus_probe": {
+      "train_accuracy": 0.99875,
+      "test_accuracy": 0.8925,
+      "n_classes": 10
+    },
+    "phylum_probe": {
+      "train_accuracy": 0.991875,
+      "test_accuracy": 0.8575,
+      "n_classes": 5
+    }
+  },
+  "random": {
+    "method": "Random embeddings (576D Gaussian)",
+    "dim": 576,
+    "params": 0,
+    "rankme": 553.11376953125,
+    "gc_r2": 0.0,
+    "genus_knn": {
+      "1": 0.0975,
+      "5": 0.096,
+      "10": 0.1115,
+      "20": 0.1065
+    },
+    "phylum_knn": {
+      "1": 0.263,
+      "5": 0.3265,
+      "10": 0.352
+    },
+    "genus_probe": {
+      "train_accuracy": 1.0,
+      "test_accuracy": 0.095,
+      "n_classes": 10
+    },
+    "phylum_probe": {
+      "train_accuracy": 0.931875,
+      "test_accuracy": 0.215,
+      "n_classes": 5
+    }
+  },
+  "gc_only": {
+    "method": "GC content only (1D)",
+    "dim": 1,
+    "params": 0,
+    "genus_knn": {
+      "1": 0.1,
+      "5": 0.1,
+      "10": 0.1,
+      "20": 0.1
+    },
+    "genus_probe": {
+      "train_accuracy": 0.448125,
+      "test_accuracy": 0.495,
+      "n_classes": 10
+    },
+    "phylum_probe": {
+      "train_accuracy": 0.515625,
+      "test_accuracy": 0.5475,
+      "n_classes": 5
+    }
+  }
+}
