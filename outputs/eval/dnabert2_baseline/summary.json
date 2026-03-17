@@ -1,0 +1,42 @@
+{
+  "model": "zhihan1996/DNABERT-2-117M",
+  "n_params": 117068544,
+  "embed_dim": 768,
+  "n_samples": 2000,
+  "rankme": 79.11380004882812,
+  "gc_r2": 0.8789467248233311,
+  "genus_knn": {
+    "1": 0.2745,
+    "5": 0.305,
+    "10": 0.317,
+    "20": 0.3185
+  },
+  "phylum_knn": {
+    "1": 0.399,
+    "5": 0.4465,
+    "10": 0.472
+  },
+  "genus_probe": {
+    "train_accuracy": 0.706875,
+    "test_accuracy": 0.4425,
+    "n_classes": 10
+  },
+  "phylum_probe": {
+    "train_accuracy": 0.746875,
+    "test_accuracy": 0.5525,
+    "n_classes": 5
+  },
+  "genera": [
+    "Bradyrhizobium",
+    "Corynebacterium",
+    "Flavobacterium",
+    "Mycobacterium",
+    "Mycolicibacterium",
+    "Paenibacillus",
+    "Pseudomonas",
+    "Streptomyces",
+    "Vibrio",
+    "Wolbachia"
+  ],
+  "wall_time": 44.58622646331787
+}
