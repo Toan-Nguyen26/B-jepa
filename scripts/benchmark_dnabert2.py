@@ -19,6 +19,7 @@ import csv
 import json
 import os
 import random
+import sys
 import time
 from collections import Counter
 
@@ -193,22 +194,41 @@ def main():
 
     # ── 1. Load DNABERT-2 ──────────────────────────────────────────────
     print("\n[1/5] Loading DNABERT-2...")
-    from transformers import AutoTokenizer, AutoModel, AutoConfig
+    import importlib
 
     model_name = "zhihan1996/DNABERT-2-117M"
+    from huggingface_hub import snapshot_download
+    from transformers import AutoTokenizer, BertConfig
+
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    path = snapshot_download(model_name)
 
-    # Patch config — newer transformers versions require pad_token_id
-    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
-    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
-        config.pad_token_id = tokenizer.pad_token_id or 0
+    # Make snapshot dir importable as a package
+    init_path = os.path.join(path, "__init__.py")
+    if not os.path.exists(init_path):
+        open(init_path, "w").close()
+    parent = os.path.dirname(path)
+    pkg_name = os.path.basename(path)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
 
-    model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True)
+    mod = importlib.import_module(pkg_name + ".bert_layers")
+
+    config = BertConfig.from_pretrained(path)
+    config.pad_token_id = tokenizer.pad_token_id or 0
+
+    model = mod.BertModel(config)
+    state = torch.load(os.path.join(path, "pytorch_model.bin"), map_location="cpu")
+    cleaned = {k.replace("bert.", ""): v for k, v in state.items()
+               if not k.startswith("cls.")}
+    model.load_state_dict(cleaned, strict=False)
     model = model.to(device).eval()
+
     n_params = sum(p.numel() for p in model.parameters())
+    embed_dim = config.hidden_size
     print(f"  Model: {model_name}")
     print(f"  Parameters: {n_params:,}")
-    print(f"  Embed dim: {model.config.hidden_size}")
+    print(f"  Embed dim: {embed_dim}")
 
     # ── 2. Build dataset ───────────────────────────────────────────────
     print("\n[2/5] Building evaluation dataset...")
