@@ -193,12 +193,17 @@ def main():
 
     # ── 1. Load DNABERT-2 ──────────────────────────────────────────────
     print("\n[1/5] Loading DNABERT-2...")
-    from transformers import AutoTokenizer, AutoModel
+    from transformers import AutoTokenizer, AutoModel, AutoConfig
 
     model_name = "zhihan1996/DNABERT-2-117M"
-    tokenizer = AutoTokenizer.from_file(model_name, trust_remote_code=True) \
-        if False else AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    model = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+
+    # Patch config — newer transformers versions require pad_token_id
+    config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
+    if not hasattr(config, "pad_token_id") or config.pad_token_id is None:
+        config.pad_token_id = tokenizer.pad_token_id or 0
+
+    model = AutoModel.from_pretrained(model_name, config=config, trust_remote_code=True)
     model = model.to(device).eval()
     n_params = sum(p.numel() for p in model.parameters())
     print(f"  Model: {model_name}")
