@@ -1,0 +1,23 @@
+{
+  "checkpoint": "outputs/checkpoints/v7.0/epoch0004.pt",
+  "n_resistance": 14,
+  "n_housekeeping": 10,
+  "n_random": 50,
+  "resistance_loci": [
+    "rpoB",
+    "katG",
+    "inhA_promoter",
+    "inhA",
+    "embB",
+    "embA",
+    "pncA",
+    "gyrA",
+    "gyrB",
+    "rrs",
+    "eis_promoter",
+    "ethA",
+    "rpsL",
+    "IS6110"
+  ],
+  "wall_time": 1283.3965289592743
+}
