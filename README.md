@@ -152,9 +152,9 @@ cls_embedding = model.encode(tokens, use_target=True)  # → (1, 576)
 
 **Monitoring.** Training health tracked via: RankMe (effective embedding rank from SVD), per-dimension CLS std, embedding norms, JEPA cosine similarity, variance floor activation, GC correlation coefficient. UMAP/t-SNE/SVD visualizations generated every epoch. All metrics logged to Weights & Biases.
 
-## Downstream: GUARD
+## Downstream: COMPASS
 
-[**GUARD**](https://github.com/VUzan-bio/guard) (Guided Universal Assay for Resistance Diagnostics) uses B-JEPA embeddings as the activity scoring engine for automated CRISPR-Cas12a diagnostic design:
+[**COMPASS**](https://compass-crispr.com/)
 
 ```
 WHO mutation catalogue → target resolution (M1) → PAM scanning (M2)
@@ -163,8 +163,6 @@ WHO mutation catalogue → target resolution (M1) → PAM scanning (M2)
 → synthetic enhancement (M6) → multiplex optimization (M7)
 → RPA primer co-design (M8) → panel assembly (M9)
 ```
-
-**Application.** 14-plex electrochemical biosensor on laser-induced graphene electrodes for point-of-care MDR-TB detection. Part of a BRIDGE Discovery project at ETH Zürich (deMello Group, D-CHAB) in collaboration with CSEM.
 
 ## Repository Structure
 
