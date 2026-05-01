@@ -1039,7 +1039,7 @@ def evaluate(
     """Evaluate on val or test set. Returns AUC, AUPRC, loss."""
     model.eval()
     # criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
-    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
+    criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.cpu())
     all_logits, all_labels = [], []
 
     for tokens, labels in loader:
