@@ -1038,6 +1038,7 @@ def evaluate(
 ) -> Dict[str, float]:
     """Evaluate on val or test set. Returns AUC, AUPRC, loss."""
     model.eval()
+    # criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     criterion  = nn.BCEWithLogitsLoss(pos_weight=pos_weight.to(device))
     all_logits, all_labels = [], []
 
